@@ -1,0 +1,39 @@
+[
+  {
+    "app_name": "vllmhymt1518bv2",
+    "model": "tencent/Hunyuan-MT-V1.5-1.8B",
+    "api_type": "openai",
+    "started_at": "2026-05-08T08:33:23.977264Z",
+    "finished_at": "2026-05-08T08:33:24.923584Z",
+    "install_decision": "reused",
+    "install_ok": true,
+    "install_seconds": 0.2,
+    "uninstall_skipped": true,
+    "uninstall_ok": true,
+    "uninstall_seconds": 0.0,
+    "endpoint": "",
+    "error": null,
+    "questions": [
+      {
+        "prompt": "请用一句话介绍人工智能。",
+        "ok": true,
+        "error": null,
+        "response_chars": 59,
+        "wall_seconds": 0.255,
+        "ttft_seconds": 0.091,
+        "load_seconds": 0.0,
+        "prompt_eval_seconds": 0.0,
+        "eval_count": 29,
+        "eval_seconds": 0.0,
+        "tps": 113.55,
+        "total_server_seconds": 0.255,
+        "prompt_tokens": 8,
+        "total_tokens": 37,
+        "client_tps": 113.55,
+        "server_tps_reported": 0.0,
+        "tokens_estimated": false,
+        "note": "ttft_seconds is APPROX (max_tokens=1 round-trip; TRUE TTFT needs stream=true); no server-side `timings` block; tps = client end-to-end (includes prefill+decode+network)"
+      }
+    ]
+  }
+]

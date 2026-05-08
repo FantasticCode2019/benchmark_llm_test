@@ -1,0 +1,62 @@
+{
+    "_comment_global": "全局默认值。每个 model 可以用同名字段单独覆盖。",
+    "cli_path": "/home/olares/test/olares-cli",
+    "install_timeout_minutes": 120,
+    "uninstall_timeout_minutes": 30,
+    "request_timeout_seconds": 1800,
+    "pull_timeout_seconds": 3600,
+    "delete_data": true,
+    "pull_model": true,
+    "_comment_auto_open": "默认 true：当 entrance authLevel != public 时，脚本自动 flip 到 public，不然外部 HTTP 会被 Authelia 挡掉。设置随 chart uninstall 一起销毁。改为 false 则脚本遇到非 public entrance 时报错，让你手动调命令。",
+    "auto_open_internal_entrance": true,
+    "skip_install_if_running": true,
+    "preserve_if_existed": false,
+    "_comment_uninstall_after_run": "true (默认)：跑完一个模型立刻 uninstall，腾 GPU/磁盘给下一个；false：跑完保留，下次 skip_install_if_running 命中可直接复用。优先级高于 preserve_if_existed。",
+    "uninstall_after_run": false,
+    "cooldown_seconds": 30,
+    "output_dir": "/home/olares/test",
+  
+    "_comment_user_envs": "HF token 等 user 级 env 已通过 `olares-cli settings advanced env user set --var OLARES_USER_HUGGINGFACE_TOKEN=hf_xxx` 一次性配置好，这里不再重复。chart 通过 valueFrom 引用时会自动注入。",
+
+    "_comment_openai_defaults": "vLLM / LLaMA.cpp 这类 api_type=openai 的 chart 的全局默认采样参数。每个 model 可以在 `openai`: {...} 里覆盖。measure_ttft_approx=true 时会额外发一个 max_tokens=1 的请求近似 TTFT。",
+    "openai_defaults": {
+      "api_key": "EMPTY",
+      "endpoint": "chat",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "measure_ttft_approx": true
+    },
+  
+    "_comment_model_name": "重要：下面每个 model_name 都是根据 chart 名/标题做的合理猜测。第一次跑之前先执行 `python3 llm_bench.py -c <thisfile> --probe` 看 chart 声明（默认值/示例），或者装好其中一个之后用 `ollama list`(ollama)/`curl URL/v1/models`(vllm 或 llamacpp) 取到准确 ID，回填到这里。脚本调 /api/generate 或 /v1/chat/completions 时这个字段必须和后端实际加载的模型名一字不差。",
+  
+    "_comment_models_format": "可选 per-model 字段：entrance_name、endpoint_url(直接覆盖端点 URL，跳过 entrance 自动发现 + 跳过 auth-level 翻转)、api_type(ollama|openai)、envs(列表，原样传给 olares-cli market install --env KEY=VALUE)、install_timeout_minutes、uninstall_timeout_minutes、delete_data、pull_model、auto_open_internal_entrance、skip_install_if_running、preserve_if_existed、uninstall_after_run、request_timeout_seconds、pull_timeout_seconds、openai(子对象，仅 api_type=openai 生效，覆盖 openai_defaults 里的 api_key/endpoint/max_tokens/temperature/top_p/extra_headers/extra_body/measure_ttft_approx)。",
+
+    "_comment_endpoint_url": "vllm/llamacpp chart 默认 entrance 是 internal、拿不到公网 URL；脚本会自动从 ports[] + namespace 拼 http://<svc>.<ns>:<port> 兜底。若你的环境从 host 解不到 cluster DNS，就在 model 里写 endpoint_url 手动指定，例如 \"endpoint_url\": \"http://localhost:30888\"（NodePort）或 \"http://10.x.y.z:8000\"（Pod IP）。",
+
+    "models": [
+      {
+        "_comment": "HY-MT1.5-1.8B - 腾讯 Hunyuan-MT V1.5 翻译模型 1.8B 版；HF id 上 tencent 没有官方 1.8B 公开仓库，--probe 看 chart 实际加载的是哪个；先填占位。",
+        "app_name": "vllmhymt1518bv2",
+        "model_name": "tencent/Hunyuan-MT-V1.5-1.8B",
+        "api_type": "openai",
+        "install_timeout_minutes": 60,
+        "pull_model": false,
+        "delete_data": true
+      }
+    ],
+  
+    "questions": [
+      "请用一句话介绍人工智能。"
+    ],
+  
+    "_comment_email": "Gmail 必须用 App Password（在 Google Account → Security → 2-Step Verification → App passwords 里生成）。配置文件含密码，建议 chmod 600。",
+    "email": {
+      "smtp_host": "smtp.gmail.com",
+      "smtp_port": 587,
+      "username": "yaoyajun@bytetrade.io",
+      "password": "uydmpwgljibrzalj",
+      "from": "yaoyajun@bytetrade.io",
+      "to": "yaoyajun@bytetrade.io",
+      "subject": "Olares LLM benchmark"
+    }
+}
