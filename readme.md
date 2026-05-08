@@ -182,3 +182,9 @@ scripts/llm_bench/
 ├── llm_bench.json        # 测试指标数据json生成
 └── readme.md             # 文档介绍
 ```
+
+---
+
+## 最终发送邮件效果
+
+![邮件内容mail.png](asset/mail.png)

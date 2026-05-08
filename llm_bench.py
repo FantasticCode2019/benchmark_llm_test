@@ -80,6 +80,7 @@ import logging
 import os
 import re
 import smtplib
+import ssl
 import subprocess
 import sys
 import time
@@ -90,6 +91,7 @@ from datetime import datetime
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape as html_escape
 from typing import Any, Optional
 
 log = logging.getLogger("llm_bench")
@@ -170,15 +172,27 @@ def market_uninstall(app: str, *, watch_minutes: int = 30,
     _run(cmd, timeout=watch_minutes * 60 + 60)
 
 
-# State buckets — keep in sync with cli/cmd/ctl/market/watch.go. We do not
-# enumerate every transient (`installingCanceling` etc.); an unknown state
-# falls into the "needs reinstall" path which is the safe default.
+# State buckets — keep in sync with cli/cmd/ctl/market/watch.go and
+# framework/app-service/pkg/appstate/state_transition.go. We do not
+# enumerate every transient (`installingCanceling` etc.); an unknown
+# state falls into the "needs reinstall" path which is the safe default.
 RUNNING_STATES = {"running"}
 PROGRESSING_STATES = {
     "pending", "downloading", "installing", "initializing",
     "upgrading", "applyingEnv", "resuming",
 }
 RECOVERABLE_STATES = {"stopped", "suspended"}  # handle via uninstall+reinstall
+
+# States where the helm release is already gone (or never landed) and the
+# state machine ONLY allows InstallOp — calling `uninstall` here would 400
+# with "UninstallOp operation is not allowed for <state> state". Skip the
+# doomed pre-uninstall and go straight to install. Source of truth:
+# `OperationAllowedInState` in
+# framework/app-service/pkg/appstate/state_transition.go.
+ROLLED_BACK_STATES = {
+    "installingCanceled", "pendingCanceled", "downloadingCanceled",
+    "installFailed", "downloadFailed",
+}
 
 
 def get_app_state(app: str) -> Optional[dict]:
@@ -255,8 +269,16 @@ def ensure_installed(app: str, *, install_minutes: int,
             log.info("%s converged to running after watch", app)
             return (True, "reused")
         log.warning("%s landed in %r after watch; reinstalling", app, new_state)
+        state = new_state
 
-    # Anything else (failed / stopped / unknown) — clean slate to make
+    if state in ROLLED_BACK_STATES:
+        log.info("%s in rolled-back state %r -> reinstalling directly "
+                 "(no uninstall needed: helm release already gone)",
+                 app, state)
+        market_install(app, watch_minutes=install_minutes, envs=install_envs)
+        return (False, "recovered")
+
+    # Anything else (stopped / *Failed / unknown) — clean slate to make
     # the benchmark deterministic.
     log.warning("%s in non-running state (%s); uninstall + reinstall", app, state)
     try:
@@ -496,6 +518,111 @@ def http_post_json(url: str, payload: dict, *, timeout: int) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _http_get_status(url: str, *, timeout: int = 10) -> tuple[int, str]:
+    """GET `url`. Returns (status, body); (0, "") on transport-level failure.
+
+    The readiness probe wants to retry on ANY non-2xx, including
+    `ConnectionRefusedError`, `TimeoutError`, ingress 502/503, etc.,
+    so we deliberately swallow transport errors here and translate
+    them into status=0 for the caller.
+    """
+    req = urllib.request.Request(
+        url, method="GET",
+        headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            try:
+                body = resp.read().decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                body = ""
+            return resp.status, body
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            body = ""
+        return exc.code, body
+    except Exception:  # noqa: BLE001
+        return 0, ""
+
+
+def wait_until_api_ready(
+    url: str, api_type: str, model: str,
+    *,
+    max_wait_minutes: int = 60,
+    probe_interval_seconds: int = 30,
+) -> None:
+    """Block until the in-container LLM API actually accepts requests.
+
+    `market install --watch` only signals that the chart reached
+    `state=running`; the LLM server inside the container may still be
+    pulling weights from HuggingFace or loading them into VRAM. For
+    vLLM / llama.cpp that gap is typically minutes, sometimes tens of
+    minutes for very large models, and there's no chart-level signal
+    for it. So we just poll the live API.
+
+    Probes:
+      ollama  -> GET /api/tags    (daemon liveness; cheap, instant.
+                                  The actual model download still
+                                  happens later in /api/pull, which
+                                  is the caller's responsibility.)
+      openai  -> GET /v1/models   (vLLM / llama-server only register
+                                  this *after* weights finish loading.
+                                  An empty `data=[]` means still loading.)
+
+    Tolerates every transport / 5xx / non-JSON failure and just sleeps
+    + retries. Raises only when the wall-clock budget is exhausted.
+    """
+    deadline = time.monotonic() + max_wait_minutes * 60
+    base = url.rstrip("/")
+    probe = f"{base}/api/tags" if api_type == "ollama" else f"{base}/v1/models"
+    log.info("waiting for API ready: GET %s (max %dm, probe every %ds)",
+             probe, max_wait_minutes, probe_interval_seconds)
+    attempt = 0
+    last_msg = ""
+    while True:
+        attempt += 1
+        status, body = _http_get_status(probe, timeout=10)
+        ready = False
+        if 200 <= status < 300:
+            if api_type == "ollama":
+                ready = True
+                last_msg = f"HTTP {status}"
+            else:
+                try:
+                    data = json.loads(body or "{}")
+                    items = data.get("data") or []
+                except json.JSONDecodeError:
+                    items = []
+                    last_msg = "200 but body not JSON (login page?)"
+                if items:
+                    ids = [(it or {}).get("id") for it in items]
+                    if model and model not in ids:
+                        last_msg = (
+                            f"HTTP {status}, served ids={ids}, "
+                            f"{model!r} not in list (continuing; chart "
+                            "probably set served-model-name)")
+                    else:
+                        last_msg = f"HTTP {status}, ids={ids}"
+                    ready = True
+                else:
+                    last_msg = ("200 but data=[] "
+                                "(server up, weights still loading)")
+        else:
+            last_msg = f"status={status}"
+        if ready:
+            log.info("API ready after %d probe(s) (%s)", attempt, last_msg)
+            return
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"API not ready after {max_wait_minutes}m on {probe}: "
+                f"last probe -> {last_msg}"
+            )
+        log.info("api not ready (%s); sleeping %ds", last_msg,
+                 probe_interval_seconds)
+        time.sleep(probe_interval_seconds)
+
+
 def auth_hint(exc: Exception) -> Optional[str]:
     """If an HTTP error looks like an auth issue, return a friendly hint.
 
@@ -531,16 +658,6 @@ def pull_model_ollama(url: str, model: str, *, timeout: int) -> None:
     http_post_json(f"{url}/api/pull",
                    {"name": model, "stream": False},
                    timeout=timeout)
-
-
-def warmup_ollama(url: str, model: str, *, timeout: int) -> None:
-    log.info("warmup (ollama): %s", model)
-    try:
-        http_post_json(f"{url}/api/generate",
-                       {"model": model, "prompt": "ping", "stream": False},
-                       timeout=timeout)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("warmup failed (continuing anyway): %s", exc)
 
 
 # --- OpenAI-compatible (vLLM / llama.cpp / oai-compat) helpers ------------ #
@@ -797,23 +914,55 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
-def warmup_openai(url: str, model: str, conf: OpenAIConfig,
-                  *, timeout: int) -> None:
-    log.info("warmup (openai): %s", model)
-    try:
-        full = _openai_url(url, conf.endpoint)
-        # warmup has its own tiny max_tokens regardless of conf to keep
-        # the cold-start cost low and predictable.
-        
-        payload = _build_openai_payload(model, "ping", conf,
-                                        max_tokens_override=4)
-        log.info("warmup url: %s", url)
-        log.info("%s warmup payload: %s",full, payload)
-        _post_openai(full, payload,
-                     _openai_headers(conf.api_key, conf.extra_headers),
-                     timeout=timeout)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("warmup failed (continuing anyway): %s", exc)
+def warmup_until_ok(url: str, model: str, api_type: str,
+                    openai_conf: Optional[OpenAIConfig],
+                    *, request_timeout: int,
+                    retries: int = 5,
+                    sleep_seconds: int = 30) -> None:
+    """Warm the model up, retrying on transient failures.
+
+    `wait_until_api_ready` already verifies the server's listing
+    endpoint, but vLLM in particular sometimes 503s once or twice on
+    the first inference call between "models endpoint live" and "first
+    real request works" (KV cache init, lazy compile, etc.). A short
+    retry loop bridges that gap.
+
+    `warmup_until_ok` keeps the original "swallow on final failure"
+    semantics: if all retries are exhausted we just log a warning and
+    let the real benchmark capture the error in QuestionResult, so a
+    flaky model doesn't take down the whole multi-model run.
+    """
+    last_exc: Optional[BaseException] = None
+    for i in range(1, retries + 1):
+        try:
+            if api_type == "openai":
+                assert openai_conf is not None
+                full = _openai_url(url, openai_conf.endpoint)
+                # Tiny max_tokens for warmup keeps cold-start cost
+                # low and predictable, regardless of conf.max_tokens.
+                payload = _build_openai_payload(
+                    model, "ping", openai_conf, max_tokens_override=4)
+                _post_openai(
+                    full, payload,
+                    _openai_headers(openai_conf.api_key,
+                                    openai_conf.extra_headers),
+                    timeout=request_timeout,
+                )
+            else:
+                http_post_json(
+                    f"{url}/api/generate",
+                    {"model": model, "prompt": "ping", "stream": False},
+                    timeout=request_timeout,
+                )
+            log.info("warmup ok (attempt %d/%d)", i, retries)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            log.warning("warmup attempt %d/%d failed: %s", i, retries, exc)
+            if i < retries:
+                time.sleep(sleep_seconds)
+    log.warning("warmup exhausted retries (last error: %s); "
+                "continuing into the benchmark anyway", last_exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -1178,6 +1327,26 @@ def bench_model(spec: dict, prompts: list[str], cfg: dict) -> ModelResult:
         #    setting is per-app and dies on uninstall.
         ensure_entrance_public(app, entrance, auth_level, auto_open=auto_open)
 
+        # 3.5 wait for the in-container LLM server to actually answer.
+        # `market install --watch` only signals chart=running; the LLM
+        # server inside may still be downloading / loading weights, and
+        # there's no chart-level signal for it. The wait is unbounded
+        # in real terms (we just sleep + retry until the model API
+        # answers OR the configured wall-clock budget expires).
+        api_ready_minutes = int(spec.get(
+            "api_ready_timeout_minutes",
+            cfg.get("api_ready_timeout_minutes", 60),
+        ))
+        api_ready_interval = int(spec.get(
+            "api_ready_probe_interval_seconds",
+            cfg.get("api_ready_probe_interval_seconds", 30),
+        ))
+        wait_until_api_ready(
+            url, api_type, model,
+            max_wait_minutes=api_ready_minutes,
+            probe_interval_seconds=api_ready_interval,
+        )
+
         # 4. ensure the model is pulled (Ollama only; vLLM ships weights via chart)
         if api_type == "ollama" and do_pull:
             try:
@@ -1185,11 +1354,18 @@ def bench_model(spec: dict, prompts: list[str], cfg: dict) -> ModelResult:
             except Exception as exc:  # noqa: BLE001
                 log.warning("pull failed (will still try generate): %s", exc)
 
-        # 5. warmup so the first benchmarked prompt isn't dominated by load
-        if api_type == "openai":
-            warmup_openai(url, model, openai_conf, timeout=pull_timeout)
-        else:
-            warmup_ollama(url, model, timeout=pull_timeout)
+        # 5. warmup with retry — gives the server one more grace window
+        #    after the readiness probe in case of lazy-init flakiness.
+        warmup_until_ok(
+            url, model, api_type,
+            openai_conf if api_type == "openai" else None,
+            request_timeout=pull_timeout,
+            retries=int(spec.get("warmup_retries",
+                                 cfg.get("warmup_retries", 5))),
+            sleep_seconds=int(spec.get(
+                "warmup_retry_sleep_seconds",
+                cfg.get("warmup_retry_sleep_seconds", 30))),
+        )
 
         # 6. real benchmark
         for prompt in prompts:
@@ -1260,140 +1436,189 @@ def bench_model(spec: dict, prompts: list[str], cfg: dict) -> ModelResult:
 # Reporting + email
 # --------------------------------------------------------------------------- #
 
-def render_html(results: list[ModelResult]) -> str:
-    style = (
-        "<style>"
-        "body{font-family:Arial,sans-serif;color:#222}"
-        "table{border-collapse:collapse;font-size:13px;margin-bottom:24px}"
-        "th,td{border:1px solid #ccc;padding:6px 10px;text-align:left;"
-        "vertical-align:top}"
-        "th{background:#f0f0f0}"
-        ".ok{color:#0a7;font-weight:bold}"
-        ".err{color:#c33;font-weight:bold}"
-        "code{background:#f6f6f6;padding:1px 4px;border-radius:3px}"
-        "small{color:#666}"
-        "</style>"
-    )
-    parts: list[str] = [style, "<h2>Olares LLM benchmark</h2>",
-                        f"<p>Run finished: {datetime.utcnow().isoformat()}Z</p>"]
+def _fmt_duration(seconds: float) -> str:
+    """`123.4` -> `2m 03s`, `5.4` -> `5.4s`. For the email subtitle only."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(round(seconds)), 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
 
-    parts.append("<h3>Summary (averages over successful prompts)</h3>")
-    parts.append(
-        "<table><tr><th>App</th><th>Model</th><th>API</th>"
-        "<th>Install</th><th>Install (s)</th><th>Uninstall (s)</th>"
-        "<th>Avg TTFT (s)</th><th>Avg TPS</th>"
-        "<th>Avg wall (s)</th><th>Status</th></tr>"
+def render_html(results: list[ModelResult]) -> str:
+    """Email-friendly single-table summary.
+
+    Designed to be readable in Gmail / Apple Mail / mobile clients.
+    Every important style is inlined (Gmail's web client strips
+    <style> blocks). Numeric columns are right-aligned with tabular
+    figures so columns line up across rows. The per-prompt detail
+    intentionally lives in the JSON attachment, not the email body.
+    """
+    total_models = len(results)
+    ok_prompts = sum(sum(1 for q in r.questions if q.ok) for r in results)
+    total_prompts = sum(len(r.questions) for r in results)
+    failed_models = sum(
+        1 for r in results
+        if r.error is not None or not any(q.ok for q in r.questions)
     )
-    for r in results:
-        ok = r.error is None and any(q.ok for q in r.questions)
-        status_cls = "ok" if ok else "err"
-        status_txt = "OK" if ok else (r.error or "no successful prompt")
-        uninstall_label = (
-            "skipped" if r.uninstall_skipped
-            else f"{r.uninstall_seconds}"
-        )
-        parts.append(
-            "<tr>"
-            f"<td>{r.app_name}</td><td>{r.model}</td><td>{r.api_type}</td>"
-            f"<td>{r.install_decision or '-'}</td>"
-            f"<td>{r.install_seconds}</td><td>{uninstall_label}</td>"
-            f"<td>{r.avg('ttft_seconds'):.3f}</td>"
-            f"<td>{r.avg('tps'):.2f}</td>"
-            f"<td>{r.avg('wall_seconds'):.3f}</td>"
-            f"<td class='{status_cls}'>{status_txt}</td>"
+    total_wall = sum(
+        q.wall_seconds for r in results for q in r.questions if q.ok
+    )
+
+    th = ("padding:8px 12px;background:#f5f6f8;"
+          "border-bottom:1px solid #dcdfe4;"
+          "color:#555;font-weight:600;font-size:11px;"
+          "text-transform:uppercase;letter-spacing:.04em;"
+          "white-space:nowrap;")
+    th_l = th + "text-align:left;"
+    th_c = th + "text-align:center;"
+    th_r = th + "text-align:right;"
+
+    cell = ("padding:9px 12px;border-bottom:1px solid #eef0f3;"
+            "vertical-align:middle;font-size:13px;color:#222;")
+    cell_l = cell + "text-align:left;"
+    cell_c = cell + "text-align:center;"
+    cell_r = cell + ("text-align:right;font-variant-numeric:tabular-nums;"
+                     "font-feature-settings:'tnum';")
+
+    rows: list[str] = []
+    for idx, r in enumerate(results):
+        ok_q = sum(1 for q in r.questions if q.ok)
+        total_q = len(r.questions)
+        run_ok = r.error is None and ok_q > 0
+        bg = "#ffffff" if idx % 2 == 0 else "#fafbfc"
+
+        if run_ok:
+            badge = ('<span style="display:inline-block;padding:2px 9px;'
+                     'border-radius:10px;background:#e6f7ee;color:#0a7d48;'
+                     'font-size:11px;font-weight:600;letter-spacing:.02em">'
+                     'OK</span>')
+        else:
+            err_full = r.error or "no successful prompt"
+            badge = ('<span style="display:inline-block;padding:2px 9px;'
+                     'border-radius:10px;background:#fdecea;color:#c0392b;'
+                     'font-size:11px;font-weight:600;letter-spacing:.02em" '
+                     f'title="{html_escape(err_full)}">FAIL</span>')
+
+        # Install/uninstall pipeline overhead appears as a faint subtitle
+        # under the app name — keeps the email "test parameters" focused
+        # while still giving an at-a-glance install/cleanup signal.
+        decision = r.install_decision or "-"
+        install_s = r.install_seconds or 0
+        if r.uninstall_skipped:
+            tail = "uninstall skipped"
+        elif r.uninstall_seconds:
+            tail = f"uninstall {r.uninstall_seconds:.0f}s"
+        else:
+            tail = "uninstall n/a"
+        sub = f"{html_escape(decision)} · install {install_s:.0f}s · {tail}"
+
+        rows.append(
+            f'<tr style="background:{bg};">'
+            f'<td style="{cell_l}">'
+            f'<div style="font-weight:600;color:#111">'
+            f'{html_escape(r.app_name)}</div>'
+            f'<div style="color:#888;font-size:11px;margin-top:2px">'
+            f'{sub}</div>'
+            f'</td>'
+            f'<td style="{cell_l}">'
+            f'<code style="background:#f3f4f6;padding:1px 6px;'
+            f'border-radius:3px;font-size:12px;color:#1a1a1a;'
+            f'font-family:SFMono-Regular,Consolas,Menlo,monospace">'
+            f'{html_escape(r.model)}</code></td>'
+            f'<td style="{cell_c};color:#666">{html_escape(r.api_type)}</td>'
+            f'<td style="{cell_c}">{ok_q}/{total_q}</td>'
+            f'<td style="{cell_r}">{r.avg("ttft_seconds"):.2f}</td>'
+            f'<td style="{cell_r};font-weight:600;color:#0b5fff">'
+            f'{r.avg("tps"):.1f}</td>'
+            f'<td style="{cell_r}">{r.avg("eval_count"):.0f}</td>'
+            f'<td style="{cell_r}">{r.avg("wall_seconds"):.2f}</td>'
+            f'<td style="{cell_c}">{badge}</td>'
             "</tr>"
         )
-    parts.append("</table>")
-    parts.append(
-        "<p><small>Install column: <code>fresh</code> = installed by this run; "
-        "<code>reused</code> = was already running and we skipped install; "
-        "<code>recovered</code> = was in a non-running state, so we "
-        "uninstalled and reinstalled.</small></p>"
-    )
 
-    parts.append("<h3>Per-prompt detail</h3>")
-    for r in results:
-        parts.append(
-            f"<h4>{r.app_name} <small>({r.model}, {r.api_type})</small></h4>"
-            f"<p>Endpoint: <code>{r.endpoint or '-'}</code><br>"
-            f"Started: {r.started_at}, finished: {r.finished_at}</p>"
+    summary_bits = [
+        f'{total_models}&nbsp;model{"s" if total_models != 1 else ""}',
+        f'{ok_prompts}/{total_prompts}&nbsp;prompts&nbsp;OK',
+        f'wall&nbsp;{_fmt_duration(total_wall)}',
+    ]
+    if failed_models:
+        summary_bits.append(
+            f'<span style="color:#c0392b">'
+            f'{failed_models}&nbsp;failed</span>'
         )
-        if not r.questions:
-            parts.append("<p><em>No measurements collected.</em></p>")
-            continue
-        if r.api_type == "openai":
-            # OpenAI rows have richer per-prompt data — surface it all.
-            parts.append(
-                "<table><tr><th>#</th><th>Prompt</th>"
-                "<th>Wall (s)</th><th>TTFT~ (s)</th>"
-                "<th>Comp tokens</th><th>Prompt tokens</th>"
-                "<th>Server eval (s)</th>"
-                "<th>Client TPS</th><th>Server TPS</th><th>TPS used</th>"
-                "<th>Status</th><th>Note</th></tr>"
-            )
-            for i, q in enumerate(r.questions, 1):
-                cls = "ok" if q.ok else "err"
-                status = "OK" if q.ok else f"ERR: {q.error}"
-                short = (q.prompt if len(q.prompt) <= 80
-                         else q.prompt[:77] + "...")
-                est_marker = "~" if q.tokens_estimated else ""
-                parts.append(
-                    "<tr>"
-                    f"<td>{i}</td><td>{short}</td>"
-                    f"<td>{q.wall_seconds}</td><td>{q.ttft_seconds}</td>"
-                    f"<td>{q.eval_count}{est_marker}</td>"
-                    f"<td>{q.prompt_tokens}</td>"
-                    f"<td>{q.eval_seconds}</td>"
-                    f"<td>{q.client_tps}</td>"
-                    f"<td>{q.server_tps_reported}</td>"
-                    f"<td><b>{q.tps}</b></td>"
-                    f"<td class='{cls}'>{status}</td>"
-                    f"<td><small>{q.note}</small></td>"
-                    "</tr>"
-                )
-        else:
-            parts.append(
-                "<table><tr><th>#</th><th>Prompt</th>"
-                "<th>Wall (s)</th><th>TTFT (s)</th>"
-                "<th>Tokens</th><th>Eval (s)</th><th>TPS</th>"
-                "<th>Status</th><th>Note</th></tr>"
-            )
-            for i, q in enumerate(r.questions, 1):
-                cls = "ok" if q.ok else "err"
-                status = "OK" if q.ok else f"ERR: {q.error}"
-                short = (q.prompt if len(q.prompt) <= 80
-                         else q.prompt[:77] + "...")
-                parts.append(
-                    "<tr>"
-                    f"<td>{i}</td><td>{short}</td>"
-                    f"<td>{q.wall_seconds}</td><td>{q.ttft_seconds}</td>"
-                    f"<td>{q.eval_count}</td><td>{q.eval_seconds}</td>"
-                    f"<td>{q.tps}</td>"
-                    f"<td class='{cls}'>{status}</td>"
-                    f"<td><small>{q.note}</small></td>"
-                    "</tr>"
-                )
-        parts.append("</table>")
+    subtitle = " &middot; ".join(summary_bits)
 
-    parts.append(
-        "<p><small>"
-        "Ollama: TTFT = load_duration + prompt_eval_duration; "
-        "TPS = eval_count / eval_duration (decode-only, server-reported). "
-        "OpenAI / vLLM / llama.cpp (stream=false): "
-        "TTFT~ is approximated by an extra max_tokens=1 round-trip "
-        "(true TTFT requires stream=true, which this script doesn't use). "
-        "Server eval/TPS come from llama.cpp's `timings` block when present; "
-        "vLLM doesn't expose them, so client TPS = completion_tokens / wall "
-        "is shown as the fallback. \"TPS used\" picks server when available, "
-        "client otherwise. \"~\" next to comp tokens means usage was missing "
-        "and the count is a char-based estimate. "
-        "Wall = client-side request→response."
-        "</small></p>"
+    return (
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,'
+        '\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif;color:#222;'
+        'max-width:920px;padding:16px 4px;line-height:1.45">'
+        # header card
+        '<div style="margin:0 0 14px 0">'
+        '<div style="font-size:20px;font-weight:600;color:#111;'
+        'margin-bottom:2px">Olares LLM benchmark</div>'
+        f'<div style="color:#666;font-size:13px">'
+        f'{datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}'
+        f' &middot; {subtitle}</div>'
+        '</div>'
+        # main table — wrapped in a div so the rounded border survives
+        # email clients that drop border-radius on <table>.
+        '<div style="border:1px solid #e5e7eb;border-radius:8px;'
+        'overflow:hidden;background:#fff">'
+        '<table style="border-collapse:collapse;width:100%;'
+        'font-size:13px"><thead><tr>'
+        f'<th style="{th_l}">App</th>'
+        f'<th style="{th_l}">Model</th>'
+        f'<th style="{th_c}">API</th>'
+        f'<th style="{th_c}">OK / N</th>'
+        f'<th style="{th_r}">TTFT (s)</th>'
+        f'<th style="{th_r}">TPS</th>'
+        f'<th style="{th_r}">Tokens</th>'
+        f'<th style="{th_r}">Wall (s)</th>'
+        f'<th style="{th_c}">Status</th>'
+        '</tr></thead><tbody>'
+        + "".join(rows) +
+        '</tbody></table></div>'
+        # footer legend — compact, single line wherever possible
+        '<p style="margin:14px 2px 0;color:#888;font-size:11.5px;'
+        'line-height:1.55">'
+        '<b>TTFT</b> = time to first token &middot; '
+        '<b>TPS</b> = generated tokens per second &middot; '
+        '<b>Tokens</b> = avg generated tokens per prompt &middot; '
+        '<b>Wall</b> = client-side request &rarr; response. '
+        'Numbers are averaged over successful prompts. For Ollama these '
+        'come from server-reported <code style="background:#f3f4f6;'
+        'padding:0 4px;border-radius:3px">load/prompt_eval/eval</code> '
+        'durations; for vLLM / llama.cpp under stream=false TTFT is '
+        'approximated via a max_tokens=1 round-trip and TPS prefers '
+        'llama.cpp <code style="background:#f3f4f6;padding:0 4px;'
+        'border-radius:3px">timings.predicted_per_second</code> when '
+        'present, else completion_tokens / wall. '
+        'Per-prompt records, errors, and notes are in the attached JSON.'
+        '</p>'
+        '</div>'
     )
-    return "".join(parts)
 
 
 def send_email(html: str, json_dump: str, cfg: dict, *, stamp: str) -> None:
+    """Build the MIME message and ship it over SMTP.
+
+    Two transport modes are supported:
+      - port 465 (or `use_ssl: true`)  -> implicit TLS via `SMTP_SSL`.
+      - any other port (typically 587) -> plain SMTP + STARTTLS upgrade.
+
+    The choice matters: hitting port 465 with `smtplib.SMTP` (the old
+    code path) sends a plaintext `EHLO` to a TLS-only listener, the
+    server RSTs immediately, and Python surfaces it as
+    `SMTPServerDisconnected: Connection unexpectedly closed` — which is
+    the exact symptom we hit when `smtp_port` was bumped to 465.
+
+    Network blips on the shared egress path are common too, so the call
+    is wrapped in a small retry loop (transport errors only — auth /
+    protocol errors are raised on the first try so we don't burn cycles
+    on something a retry can't fix).
+    """
     smtp_cfg = cfg["email"]
     msg = MIMEMultipart("mixed")
     msg["Subject"] = smtp_cfg.get(
@@ -1401,28 +1626,89 @@ def send_email(html: str, json_dump: str, cfg: dict, *, stamp: str) -> None:
     msg["From"] = smtp_cfg["from"]
     msg["To"] = smtp_cfg["to"]
 
-    # body: HTML for humans
     body = MIMEMultipart("alternative")
-    body.attach(MIMEText("Olares LLM benchmark results — see HTML body or "
-                         "attached JSON.", "plain", _charset="utf-8"))
+    body.attach(MIMEText(
+        "Olares LLM benchmark results — see HTML body or attached JSON.",
+        "plain", _charset="utf-8"))
     body.attach(MIMEText(html, "html", _charset="utf-8"))
     msg.attach(body)
 
-    # attachment: full aggregated JSON
     att = MIMEApplication(json_dump.encode("utf-8"), _subtype="json")
     att.add_header("Content-Disposition", "attachment",
                    filename=f"llm_bench_{stamp}.json")
     msg.attach(att)
 
-    log.info("sending email via %s:%d to %s",
-             smtp_cfg["smtp_host"], smtp_cfg["smtp_port"], smtp_cfg["to"])
-    with smtplib.SMTP(smtp_cfg["smtp_host"], smtp_cfg["smtp_port"],
-                      timeout=60) as s:
-        s.ehlo()
-        s.starttls()
-        s.login(smtp_cfg["username"], smtp_cfg["password"])
-        s.sendmail(smtp_cfg["from"], [smtp_cfg["to"]], msg.as_string())
-    log.info("email sent")
+    host = smtp_cfg["smtp_host"]
+    port = int(smtp_cfg["smtp_port"])
+    timeout = int(smtp_cfg.get("smtp_timeout", 120))
+    retries = max(1, int(smtp_cfg.get("smtp_retries", 3)))
+    backoff = int(smtp_cfg.get("smtp_retry_backoff", 5))
+    # Explicit override beats heuristic. Heuristic: 465 -> implicit TLS,
+    # everything else -> STARTTLS. This matches what every major
+    # provider (Gmail, Outlook, SES, Mailgun, ...) actually advertises.
+    use_ssl_cfg = smtp_cfg.get("use_ssl")
+    use_ssl = bool(use_ssl_cfg) if use_ssl_cfg is not None else (port == 465)
+
+    rcpt = [a.strip() for a in str(smtp_cfg["to"]).split(",") if a.strip()]
+    raw = msg.as_string()
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, retries + 1):
+        try:
+            log.info(
+                "sending email via %s:%d (ssl=%s, timeout=%ds, "
+                "attempt %d/%d) to %s",
+                host, port, use_ssl, timeout, attempt, retries,
+                ", ".join(rcpt))
+            ctx = ssl.create_default_context()
+            if use_ssl:
+                with smtplib.SMTP_SSL(host, port, timeout=timeout,
+                                      context=ctx) as s:
+                    s.ehlo()
+                    s.login(smtp_cfg["username"], smtp_cfg["password"])
+                    s.sendmail(smtp_cfg["from"], rcpt, raw)
+            else:
+                with smtplib.SMTP(host, port, timeout=timeout) as s:
+                    s.ehlo()
+                    s.starttls(context=ctx)
+                    s.ehlo()  # re-EHLO after STARTTLS (RFC 3207)
+                    s.login(smtp_cfg["username"], smtp_cfg["password"])
+                    s.sendmail(smtp_cfg["from"], rcpt, raw)
+            log.info("email sent")
+            return
+        # NOTE: order matters here. `smtplib.SMTPException` (and therefore
+        # SMTPAuthenticationError, SMTPResponseException, ...) inherits
+        # from OSError, so we MUST handle the protocol-level subclasses
+        # first; otherwise the broad OSError catch below would swallow
+        # auth failures and retry them pointlessly until the budget runs
+        # out.
+        except smtplib.SMTPAuthenticationError:
+            # bad credentials — retrying won't help
+            raise
+        except (smtplib.SMTPServerDisconnected,
+                smtplib.SMTPConnectError,
+                TimeoutError,
+                ConnectionError) as exc:
+            last_exc = exc
+            log.warning("smtp attempt %d/%d failed: %s: %s",
+                        attempt, retries, type(exc).__name__, exc)
+            if attempt < retries:
+                time.sleep(min(backoff * attempt, 60))
+        except smtplib.SMTPException:
+            # other protocol-level error (5xx etc.) — won't be rescued
+            # by a retry, surface it immediately
+            raise
+        except OSError as exc:
+            # low-level transport error not covered by the SMTP* aliases
+            # (e.g. ECONNRESET in a weird state)
+            last_exc = exc
+            log.warning("smtp attempt %d/%d failed: %s: %s",
+                        attempt, retries, type(exc).__name__, exc)
+            if attempt < retries:
+                time.sleep(min(backoff * attempt, 60))
+
+    assert last_exc is not None
+    raise last_exc
 
 
 # --------------------------------------------------------------------------- #
