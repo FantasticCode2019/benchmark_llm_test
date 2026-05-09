@@ -17,7 +17,6 @@ from utils.format import human_bytes
 from utils.http import (
     http_get_status,
     http_post_json,
-    ollama_model_names,
     ollama_tags,
 )
 
@@ -30,24 +29,24 @@ def wait_until_api_ready(
     max_wait_minutes: int = 60,
     probe_interval_seconds: int = 30,
 ) -> None:
-    """Block until the backend reports the target model as fully loaded.
+    """Block until the backend reports a model as fully loaded.
 
     `market install --watch` only signals chart=running; the LLM server
     inside the container may still be pulling weights or initializing.
     No chart-level signal exists, so we poll the LLM API itself:
 
-      ollama  -> GET /api/tags, target model in `models[].name`
-                 (same judgment chart launcher uses for "Waiting for
-                 Ollama" → "Ready to chat")
+      ollama  -> GET /api/tags, `models[]` non-empty
+                 (since each chart hosts exactly one model and we
+                 uninstall between models, any entry == the target)
       openai  -> GET /v1/models, `data[]` non-empty (vLLM / llama-server
                  only register this endpoint AFTER weights finish loading)
     """
     deadline = time.monotonic() + max_wait_minutes * 60
     base = url.rstrip("/")
     if api_type == "ollama":
-        log.info("waiting for ollama model %r in /api/tags "
+        log.info("waiting for ollama /api/tags models[] non-empty "
                  "(max %dm, probe every %ds)",
-                 model, max_wait_minutes, probe_interval_seconds)
+                 max_wait_minutes, probe_interval_seconds)
     else:
         log.info("waiting for vllm /v1/models data[] non-empty "
                  "(max %dm, probe every %ds)",
@@ -61,23 +60,17 @@ def wait_until_api_ready(
             models, _, err = ollama_tags(base)
             if models is None:
                 last_msg = f"daemon not reachable ({err})"
+            elif models:
+                sizes = ", ".join(
+                    f"{(m or {}).get('name', '?')}="
+                    f"{human_bytes((m or {}).get('size'))}"
+                    for m in models
+                )
+                last_msg = f"daemon up, {len(models)} model(s): {sizes}"
+                ready = True
             else:
-                names = ollama_model_names(models)
-                if model in names:
-                    sizes = ", ".join(
-                        f"{m.get('name')}={human_bytes(m.get('size'))}"
-                        for m in models
-                        if (m or {}).get("name") == model
-                    )
-                    last_msg = f"target {model!r} present ({sizes})"
-                    ready = True
-                elif names:
-                    last_msg = (f"daemon up, {len(names)} other model(s) "
-                                f"present={names}; target {model!r} "
-                                "not yet in /api/tags")
-                else:
-                    last_msg = (f"daemon up but /api/tags is empty; "
-                                f"waiting for {model!r} to be pulled")
+                last_msg = ("daemon up but /api/tags is empty; "
+                            "waiting for the chart to pull")
         else:
             status, body = http_get_status(f"{base}/v1/models", timeout=10)
             if not (200 <= status < 300):
