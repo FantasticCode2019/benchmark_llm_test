@@ -1,72 +1,79 @@
 {
-    "_comment_global": "全局默认值。每个 model 可以用同名字段单独覆盖。",
-    "cli_path": "/home/olares/test/olares-cli",
-    "install_timeout_minutes": 120,
-    "uninstall_timeout_minutes": 30,
-    "request_timeout_seconds": 1800,
-    "pull_timeout_seconds": 3600,
-    "_comment_api_ready": "chart 进入 running 状态后，容器内 LLM 服务可能还在拉权重 / 加载到显存（vLLM、llama.cpp 经常如此），无法预测，只能轮询。脚本在 install 之后、warmup 之前 GET /v1/models（openai）或 /api/tags（ollama），最长等 api_ready_timeout_minutes 分钟、每次失败 sleep api_ready_probe_interval_seconds 秒。warmup 也带重试：warmup_retries 次、每次间隔 warmup_retry_sleep_seconds 秒。这几个值都可以写进单个 model 覆盖。",
-    "api_ready_timeout_minutes": 60,
-    "api_ready_probe_interval_seconds": 30,
-    "warmup_retries": 5,
-    "warmup_retry_sleep_seconds": 30,
-    "delete_data": true,
-    "pull_model": true,
-    "_comment_auto_open": "默认 true：当 find_entrance 发现 entrance 的 authLevel != public 时，脚本自动调 `olares-cli settings apps auth-level set ... --level public` + `... policy set ... --default-policy public` 让脚本能匿名访问 API；改为 false 时遇到非 public 直接报错并给出手动命令。设置是 per-app 的，模型 uninstall 时跟着销毁，所以不会泄漏。`set_public_during_run` 是旧名字，true 时等同于 auto_open_internal_entrance=true。",
-    "auto_open_internal_entrance": true,
-    "set_public_during_run": false,
-    "skip_install_if_running": true,
-    "preserve_if_existed": false,
-    "_comment_uninstall_after_run": "true (默认)：跑完一个模型立刻 uninstall，腾 GPU/磁盘给下一个；false：跑完保留，下次 skip_install_if_running 命中可直接复用。优先级高于 preserve_if_existed。",
-    "uninstall_after_run": false,
-    "cooldown_seconds": 30,
-    "output_dir": "/home/olares/test",
-  
-    "_comment_user_envs": "HF token 等 user 级 env 已通过 `olares-cli settings advanced env user set --var OLARES_USER_HUGGINGFACE_TOKEN=hf_xxx` 一次性配置好，这里不再重复。chart 通过 valueFrom 引用时会自动注入。",
+  "cli_path": "olares-cli",
+  "install_timeout_minutes": 90,
+  "uninstall_timeout_minutes": 30,
+  "request_timeout_seconds": 1800,
+  "pull_timeout_seconds": 3600,
+  "api_ready_timeout_minutes": 60,
+  "api_ready_probe_interval_seconds": 30,
+  "warmup_retries": 10,
+  "warmup_retry_sleep_seconds": 30,
+  "pull_max_attempts": 5,
+  "pull_retry_sleep_seconds": 30,
+  "delete_data": true,
+  "pull_model": false,
+  "auto_open_internal_entrance": true,
+  "skip_install_if_running": true,
+  "preserve_if_existed": false,
+  "uninstall_after_run": true,
+  "cooldown_seconds": 30,
+  "output_dir": "/home/olares/test",
 
-    "_comment_openai_defaults": "vLLM / LLaMA.cpp 这类 api_type=openai 的 chart 的全局默认采样参数。每个 model 可以在 `openai`: {...} 里覆盖。measure_ttft_approx=true 时会额外发一个 max_tokens=1 的请求近似 TTFT。",
-    "openai_defaults": {
-      "api_key": "EMPTY",
-      "endpoint": "chat",
-      "max_tokens": 256,
-      "temperature": 0.0,
-      "measure_ttft_approx": true
+  "openai_defaults": {
+    "api_key": "EMPTY",
+    "endpoint": "chat",
+    "max_tokens": 256,
+    "temperature": 0.0,
+    "top_p": null,
+    "extra_headers": {},
+    "extra_body": {},
+    "measure_ttft_approx": true
+  },
+
+  "models": [
+    {
+      "app_name": "ollamadeepseekr114bv2",
+      "model_name": "deepseek-r1:14b",
+      "api_type": "ollama"
     },
-  
-    "_comment_model_name": "重要：下面每个 model_name 都是根据 chart 名/标题做的合理猜测。第一次跑之前先执行 `python3 llm_bench.py -c <thisfile> --probe` 看 chart 声明（默认值/示例），或者装好其中一个之后用 `ollama list`(ollama)/`curl URL/v1/models`(vllm 或 llamacpp) 取到准确 ID，回填到这里。脚本调 /api/generate 或 /v1/chat/completions 时这个字段必须和后端实际加载的模型名一字不差。",
-  
-    "_comment_models_format": "可选 per-model 字段：entrance_name、endpoint_url(直接覆盖端点 URL，跳过 entrance 自动发现 + 跳过 auth-level 翻转)、api_type(ollama|openai)、envs(列表，原样传给 olares-cli market install --env KEY=VALUE)、install_timeout_minutes、uninstall_timeout_minutes、delete_data、pull_model、auto_open_internal_entrance、skip_install_if_running、preserve_if_existed、uninstall_after_run、request_timeout_seconds、pull_timeout_seconds、openai(子对象，仅 api_type=openai 生效，覆盖 openai_defaults 里的 api_key/endpoint/max_tokens/temperature/top_p/extra_headers/extra_body/measure_ttft_approx)。",
-
-    "_comment_endpoint_url": "vllm/llamacpp chart 默认 entrance 是 internal、拿不到公网 URL；脚本会自动从 ports[] + namespace 拼 http://<svc>.<ns>:<port> 兜底。若你的环境从 host 解不到 cluster DNS，就在 model 里写 endpoint_url 手动指定，例如 \"endpoint_url\": \"http://localhost:30888\"（NodePort）或 \"http://10.x.y.z:8000\"（Pod IP）。",
-
-    "models": [
-      {
-        "_comment": "HY-MT1.5-1.8B - 腾讯 Hunyuan-MT V1.5 翻译模型 1.8B 版；HF id 上 tencent 没有官方 1.8B 公开仓库，--probe 看 chart 实际加载的是哪个；先填占位。",
-        "app_name": "vllmhymt1518bv2",
-        "model_name": "tencent/Hunyuan-MT-V1.5-1.8B",
-        "api_type": "openai",
-        "install_timeout_minutes": 60,
-        "pull_model": false,
-        "delete_data": true
+    {
+      "app_name": "ollamaqwen314bv2",
+      "model_name": "qwen3:14b",
+      "api_type": "ollama"
+    },
+    {
+      "app_name": "vllmgemma312bitv2",
+      "model_name": "google/gemma-3-12b-it",
+      "api_type": "openai",
+      "install_timeout_minutes": 120,
+      "openai": {
+        "max_tokens": 512,
+        "measure_ttft_approx": false
       }
-    ],
-  
-    "questions": [
-      "请用一句话介绍人工智能。"
-    ],
-  
-    "_comment_email": "Gmail 必须用 App Password（在 Google Account → Security → 2-Step Verification → App passwords 里生成）。配置文件含密码，建议 chmod 600。",
-    "email": {
-      "smtp_host": "smtp.gmail.com",
-      "smtp_port": 465,
-      "use_ssl": true,
-      "smtp_timeout": 120,
-      "smtp_retries": 3,
-      "smtp_retry_backoff": 5,
-      "username": "yaoyajun@bytetrade.io",
-      "password": "uydmpwgljibrzalj",
-      "from": "yaoyajun@bytetrade.io",
-      "to": "yaoyajun@bytetrade.io",
-      "subject": "Olares LLM benchmark"
+    },
+    {
+      "app_name": "llamacppgptoss120bggufv2",
+      "model_name": "gpt-oss-120b",
+      "api_type": "openai",
+      "install_timeout_minutes": 240
     }
+  ],
+
+  "questions": [
+    "请用一句话介绍人工智能。"
+  ],
+
+  "email": {
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 465,
+    "use_ssl": true,
+    "smtp_timeout": 120,
+    "smtp_retries": 3,
+    "smtp_retry_backoff": 5,
+    "username": "you@example.com",
+    "password": "<gmail-app-password>",
+    "from": "you@example.com",
+    "to": "you@example.com",
+    "subject": "Olares LLM benchmark"
+  }
 }
