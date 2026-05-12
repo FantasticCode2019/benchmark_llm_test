@@ -59,7 +59,8 @@ def _resolve_use_ssl(email: EmailConfig) -> bool:
 
 
 def send_email(html: str, json_dump: str, cfg: AppConfig,
-               *, stamp: str) -> None:
+               *, stamp: str,
+               excel_bytes: bytes | None = None) -> None:
     """Build the MIME message and ship it over SMTP, with retry on
     transport errors only.
 
@@ -68,6 +69,14 @@ def send_email(html: str, json_dump: str, cfg: AppConfig,
     the server RSTs, surfacing as ``SMTPServerDisconnected``.
 
     Auth/protocol errors are raised on the first try (a retry can't help).
+
+    ``excel_bytes`` is the Ollama-only summary workbook produced by
+    :func:`llm_bench.data.excel_report.render_ollama_excel`. When non-
+    empty it's attached as a third part alongside the HTML body + JSON
+    dump; the official .xlsx MIME type is
+    ``application/vnd.openxmlformats-officedocument.spreadsheetml.sheet``.
+    Pass None / empty bytes (the default) to suppress the attachment —
+    used by runs that contained no Ollama models.
     """
     email = cfg.email
     msg = MIMEMultipart("mixed")
@@ -86,6 +95,14 @@ def send_email(html: str, json_dump: str, cfg: AppConfig,
     att.add_header("Content-Disposition", "attachment",
                    filename=f"llm_bench_{stamp}.json")
     msg.attach(att)
+
+    if excel_bytes:
+        xlsx = MIMEApplication(
+            excel_bytes,
+            _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        xlsx.add_header("Content-Disposition", "attachment",
+                        filename=f"llm_bench_ollama_{stamp}.xlsx")
+        msg.attach(xlsx)
 
     use_ssl = _resolve_use_ssl(email)
     retries = max(1, email.smtp_retries)

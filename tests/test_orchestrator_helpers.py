@@ -10,7 +10,11 @@ from __future__ import annotations
 import logging
 
 from llm_bench.core._context import BenchmarkContext
-from llm_bench.core.orchestrator import _log_prompt_result
+from llm_bench.core.orchestrator import (
+    _log_prompt_result,
+    _step_describe_ollama_model,
+    _step_probe_ollama_thinking,
+)
 from llm_bench.domain import (
     ApiType,
     AppConfig,
@@ -26,9 +30,10 @@ from llm_bench.domain import (
 
 def _make_ctx(*, error: str | None = None,
               questions: list[QuestionResult] | None = None,
+              api_type: ApiType = ApiType.OLLAMA,
               ) -> BenchmarkContext:
     """Build a BenchmarkContext with minimal but valid wiring."""
-    spec = ModelSpec(app_name="appX", model_name="mX")
+    spec = ModelSpec(app_name="appX", model_name="mX", api_type=api_type)
     defaults = GlobalDefaults()
     cfg = AppConfig(
         defaults=defaults,
@@ -39,16 +44,22 @@ def _make_ctx(*, error: str | None = None,
             password="p", sender="u@x", to="u@x",
         ),
     )
-    return BenchmarkContext(
+    ctx = BenchmarkContext(
         spec=spec,
         cfg=cfg,
         opts=ResolvedOptions.for_model(spec, defaults),
         openai=OpenAIConfig(),
         result=ModelResult(app_name="appX", model="mX",
+                           api_type=api_type,
                            error=error,
                            questions=list(questions or [])),
         model_name="mX",
     )
+    # Entrance URL is populated by `_step_resolve_entrance`; the two
+    # ollama probe steps need it to call the client, so simulate that
+    # having already happened.
+    ctx.entrance_url = "http://ollama.local"
+    return ctx
 
 
 class TestBenchmarkContext:
@@ -147,3 +158,105 @@ class TestLogPromptResult:
         with caplog.at_level(logging.INFO, logger="llm_bench"):
             _log_prompt_result(ApiType.OLLAMA, qr_equal)
         assert not any("think_ttft=" in rec.message for rec in caplog.records)
+
+
+class TestOllamaSupportsThinkingStep:
+    """``_step_probe_ollama_thinking`` only runs for ollama and records
+    the probe result onto ``ctx.result.ollama_supports_thinking``.
+    Failures stay best-effort: they leave the field at None.
+    """
+
+    def test_skipped_for_openai_api(self, monkeypatch):
+        ctx = _make_ctx(api_type=ApiType.OPENAI)
+        called = {"n": 0}
+
+        def fake(*a, **kw):
+            called["n"] += 1
+            return True
+
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.ollama_supports_thinking", fake)
+        _step_probe_ollama_thinking(ctx)
+        assert called["n"] == 0
+        assert ctx.result.ollama_supports_thinking is None
+
+    def test_records_true_for_ollama(self, monkeypatch):
+        ctx = _make_ctx(api_type=ApiType.OLLAMA)
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.ollama_supports_thinking",
+            lambda *a, **kw: True)
+        _step_probe_ollama_thinking(ctx)
+        assert ctx.result.ollama_supports_thinking is True
+
+    def test_records_false_for_ollama(self, monkeypatch):
+        ctx = _make_ctx(api_type=ApiType.OLLAMA)
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.ollama_supports_thinking",
+            lambda *a, **kw: False)
+        _step_probe_ollama_thinking(ctx)
+        assert ctx.result.ollama_supports_thinking is False
+
+    def test_swallows_exception(self, monkeypatch, caplog):
+        ctx = _make_ctx(api_type=ApiType.OLLAMA)
+
+        def boom(*a, **kw):
+            raise RuntimeError("daemon down")
+
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.ollama_supports_thinking", boom)
+        with caplog.at_level(logging.WARNING, logger="llm_bench"):
+            _step_probe_ollama_thinking(ctx)
+        # Field remains None so downstream can tell "probe failed" from
+        # "probe ran and returned False".
+        assert ctx.result.ollama_supports_thinking is None
+        assert any("ollama_supports_thinking" in rec.message
+                   for rec in caplog.records)
+
+
+class TestOllamaDescribeModelStep:
+    """``_step_describe_ollama_model`` stores the descriptor dict for
+    ollama runs and leaves non-ollama / failing runs untouched.
+    """
+
+    def test_skipped_for_openai_api(self, monkeypatch):
+        ctx = _make_ctx(api_type=ApiType.OPENAI)
+        called = {"n": 0}
+
+        def fake(*a, **kw):
+            called["n"] += 1
+            return {"family": "x"}
+
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.ollama_describe_model", fake)
+        _step_describe_ollama_model(ctx)
+        assert called["n"] == 0
+        assert ctx.result.ollama_descriptor is None
+
+    def test_records_descriptor_for_ollama(self, monkeypatch):
+        ctx = _make_ctx(api_type=ApiType.OLLAMA)
+        sample = {
+            "model": "qwen3:8b",
+            "family": "qwen3",
+            "parameter_size": "8.2B",
+            "quantization": "Q4_K_M",
+            "max_context": 40960,
+        }
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.ollama_describe_model",
+            lambda *a, **kw: sample)
+        _step_describe_ollama_model(ctx)
+        assert ctx.result.ollama_descriptor == sample
+
+    def test_swallows_exception(self, monkeypatch, caplog):
+        ctx = _make_ctx(api_type=ApiType.OLLAMA)
+
+        def boom(*a, **kw):
+            raise RuntimeError("describe failed")
+
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.ollama_describe_model", boom)
+        with caplog.at_level(logging.WARNING, logger="llm_bench"):
+            _step_describe_ollama_model(ctx)
+        assert ctx.result.ollama_descriptor is None
+        assert any("ollama_describe_model" in rec.message
+                   for rec in caplog.records)

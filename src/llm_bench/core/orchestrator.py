@@ -10,12 +10,14 @@ small enough to test (or replace) in isolation.
 Phase ordering and failure semantics::
 
        ┌────────────────── try ────────────────────┐
-       │  _step_install            (raises -> stop)│
-       │  _step_resolve_entrance   (raises -> stop)│
-       │  _step_open_entrance      (raises -> stop)│
-       │  _step_wait_ready         (raises -> stop)│
-       │  _step_optional_pull      (warns; never raises)│
-       │  _step_run_prompts        (per-prompt try; never raises overall)│
+       │  _step_install                  (raises -> stop)│
+       │  _step_resolve_entrance         (raises -> stop)│
+       │  _step_open_entrance            (raises -> stop)│
+       │  _step_wait_ready               (raises -> stop)│
+       │  _step_optional_pull            (warns; never raises)│
+       │  _step_probe_ollama_thinking    (ollama-only; warns; never raises)│
+       │  _step_run_prompts              (per-prompt try; never raises overall)│
+       │  _step_describe_ollama_model    (ollama-only; warns; never raises)│
        └───────────────────────────────────────────┘
        ┌──────────────── finally ─────────────────┐
        │  _step_archive_pod_logs   (warns; never raises)│
@@ -32,6 +34,7 @@ import logging
 import subprocess
 import time
 
+from llm_bench.clients.ollama_client import ollama_describe_model, ollama_supports_thinking
 from llm_bench.constants import LOG_NAMESPACE
 from llm_bench.core._context import BenchmarkContext
 from llm_bench.core.benchmark.ollama import benchmark_prompt_ollama, pull_model_ollama
@@ -87,7 +90,9 @@ def bench_model(spec: ModelSpec, prompts: list[str],
         _step_open_entrance(ctx)
         _step_wait_ready(ctx)
         _step_optional_pull(ctx)
+        _step_probe_ollama_thinking(ctx)
         _step_run_prompts(ctx)
+        _step_describe_ollama_model(ctx)
     except subprocess.CalledProcessError as exc:
         _record_cli_error(ctx, exc)
     except Exception as exc:  # any other failure is captured on the result
@@ -217,6 +222,40 @@ def _step_optional_pull(ctx: BenchmarkContext) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 5b — ollama-only: probe /api/show for the `thinking` capability
+# ---------------------------------------------------------------------------
+
+
+def _step_probe_ollama_thinking(ctx: BenchmarkContext) -> None:
+    """Runtime detection of whether the loaded ollama model exposes the
+    ``thinking`` capability via /api/show.
+
+    Distinct from ``ctx.opts.thinking`` / ``spec.thinking`` — those are
+    *user intent* (drives the streaming TTFT probe in the benchmark);
+    this one is *ground truth* read from the daemon and recorded on
+    ``ctx.result.ollama_supports_thinking`` so the Excel attachment can
+    show the actual capability map next to the configured flag.
+
+    Best-effort: any failure logs a warning and leaves the field at None
+    so downstream consumers can tell "probe didn't run" apart from a
+    truthy / falsy answer.
+    """
+    if ctx.opts.api_type is not ApiType.OLLAMA:
+        return
+    try:
+        supports = ollama_supports_thinking(
+            ctx.entrance_url, timeout=ctx.opts.request_timeout)
+    except Exception as exc:
+        log.warning("%s: ollama_supports_thinking probe failed: %s",
+                    ctx.app, exc)
+        return
+    ctx.result.ollama_supports_thinking = supports
+    log.info("%s: ollama runtime supports_thinking=%s "
+             "(configured spec.thinking=%s)",
+             ctx.app, supports, ctx.opts.thinking)
+
+
+# ---------------------------------------------------------------------------
 # Step 6 — per-prompt benchmark
 # ---------------------------------------------------------------------------
 
@@ -277,6 +316,36 @@ def _log_prompt_result(api_type: ApiType, qr: QuestionResult) -> None:
         log.info("  -> ttft=%.3fs%s tokens=%d tps=%.2f wall=%.3fs",
                  qr.ttft_seconds, think, qr.eval_count,
                  qr.tps, qr.wall_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Step 6b — ollama-only: snapshot /api/ps + /api/tags + /api/show
+# ---------------------------------------------------------------------------
+
+
+def _step_describe_ollama_model(ctx: BenchmarkContext) -> None:
+    """Record the loaded model's descriptor (family / parameter_size /
+    quantization / context window / disk-vs-vram split / processor) by
+    merging /api/ps + /api/tags + /api/show.
+
+    Runs AFTER ``_step_run_prompts`` on purpose — by then the model has
+    been hit at least once, so /api/ps reliably reports the loaded
+    entry (and the VRAM / RAM / kvcache deltas reflect a warmed-up
+    state instead of an empty cache). The descriptor lands on
+    ``ctx.result.ollama_descriptor`` and feeds the Excel attachment.
+
+    Best-effort: a failure logs a warning; the rest of the run (the
+    JSON / HTML report, the uninstall) proceeds normally.
+    """
+    if ctx.opts.api_type is not ApiType.OLLAMA:
+        return
+    try:
+        descriptor = ollama_describe_model(
+            ctx.entrance_url, timeout=ctx.opts.request_timeout)
+    except Exception as exc:
+        log.warning("%s: ollama_describe_model failed: %s", ctx.app, exc)
+        return
+    ctx.result.ollama_descriptor = descriptor
 
 
 # ---------------------------------------------------------------------------

@@ -87,15 +87,18 @@ def main() -> int:
             time.sleep(cfg.cooldown_seconds)
 
     out_dir = cfg.output_dir or os.path.dirname(os.path.abspath(args.config))
-    json_path, _, json_dump, html = write_reports(results, out_dir)
-    stamp = os.path.basename(json_path).replace("llm_bench_", "").replace(".json", "")
+    artifacts = write_reports(results, out_dir)
+    stamp = (os.path.basename(artifacts.json_path)
+             .replace("llm_bench_", "").replace(".json", ""))
 
     if args.no_email:
         log.info("--no-email set, skipping email")
         return 0
 
     try:
-        send_email(html, json_dump, cfg, stamp=stamp)
+        send_email(artifacts.html, artifacts.json_dump, cfg,
+                   stamp=stamp,
+                   excel_bytes=artifacts.excel_bytes or None)
     except Exception:
         log.exception("email send failed")
         return 1

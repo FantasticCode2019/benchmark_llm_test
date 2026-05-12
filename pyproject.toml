@@ -22,6 +22,7 @@ classifiers = [
 ]
 dependencies = [
     "openai>=1.30",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]

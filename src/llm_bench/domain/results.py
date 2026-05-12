@@ -102,6 +102,20 @@ class ModelResult:
     # successfully tar.gz'd the pod log directories. Path is local to
     # the host that ran the benchmark.
     pod_logs_archive: str | None = None
+    # Ollama-only runtime metadata. Populated by the orchestrator AFTER
+    # readiness succeeds:
+    #   * `ollama_supports_thinking` — result of probing /api/show's
+    #     `capabilities` array (independent of the configured
+    #     `spec.thinking` flag). None means "not probed" (non-Ollama
+    #     backend, or the probe itself failed).
+    #   * `ollama_descriptor` — full /api/ps + /api/tags + /api/show
+    #     descriptor dict as returned by `ollama_describe_model`.
+    #     None for non-Ollama runs; empty descriptor when the daemon
+    #     was reachable but had no models loaded yet.
+    # Both feed the per-run Excel attachment; they are intentionally
+    # absent from the HTML email body (kept lean).
+    ollama_supports_thinking: bool | None = None
+    ollama_descriptor: dict | None = None
     questions: list[QuestionResult] = field(default_factory=list)
 
     def avg(self, attr: str) -> float:
