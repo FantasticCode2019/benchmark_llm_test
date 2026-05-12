@@ -56,9 +56,10 @@ def bench_model(spec: dict, prompts: list, cfg: dict) -> ModelResult:
     uninstall_after = bool(_opt(spec, cfg, "uninstall_after_run", True))
     install_envs = list(spec.get("envs") or [])
     openai_conf = openai_config_from(spec, cfg)
-    # When true, run an additional streaming probe per prompt to capture
-    # `thinking_ttft_seconds` (first reasoning/thinking token time).
-    # Per-model only — most models don't have a thinking phase to measure.
+    # Per-model `thinking` flag drives the email's `Has Think` column
+    # AND whether the per-prompt streaming probe runs to capture
+    # `thinking_ttft_seconds`. Set true ONLY for reasoning models
+    # (DeepSeek-R1, Qwen3, GPT-OSS, o1-style, ...).
     thinking = bool(_opt(spec, cfg, "thinking", False))
     # On failure (install/readiness/benchmark/uninstall), tar+gzip
     # /var/log/pods/*<app>* into pod_logs_dir so we can grep the chart's
@@ -134,7 +135,7 @@ def bench_model(spec: dict, prompts: list, cfg: dict) -> ModelResult:
                 log.warning("pull failed (model already present, "
                             "ignoring): %s", exc)
 
-        # 6. real benchmark
+        # 5. real benchmark
         for prompt in prompts:
             log.info("prompt: %s", prompt[:60].replace("\n", " "))
             if api_type == "openai":

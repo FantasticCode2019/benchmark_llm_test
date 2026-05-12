@@ -50,6 +50,7 @@
       "app_name": "vllmgemma312bitv2",
       "model_name": "google/gemma-3-12b-it",
       "api_type": "openai",
+      "thinking": false,
       "install_timeout_minutes": 120,
       "openai": {
         "max_tokens": 512,
@@ -60,6 +61,7 @@
       "app_name": "llamacppgptoss120bggufv2",
       "model_name": "gpt-oss-120b",
       "api_type": "openai",
+      "thinking": false,
       "install_timeout_minutes": 240
     }
   ],

@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-import urllib.error
 import urllib.request
 from typing import Optional, Tuple
 
@@ -140,16 +139,20 @@ def _measure_ollama_streaming_ttfts(url: str, model: str, prompt: str,
                                     *, request_timeout: int,
                                     ) -> Tuple[Optional[float],
                                                Optional[float]]:
-    """Open ONE streaming /api/generate call with `think:true` and read the
-    first non-empty `thinking` and `response` chunks. Returns
-    (thinking_ttft, answer_ttft); either may be None if the corresponding
-    field never appeared (e.g. the model has no thinking phase, or the
-    server merges thinking into `response`).
+    """Open ONE streaming /api/generate call with `think:true` and read
+    the first non-empty `thinking` and `response` chunks. Returns
+    `(thinking_ttft, answer_ttft)`; either field is None when not
+    observed (probe failure, model didn't actually emit reasoning, ...).
 
-    Per cankao.md: ollama 0.10+ exposes thinking via the `thinking` field
-    on each NDJSON chunk; the actual answer arrives in `response`. We
-    close the connection as soon as both are seen so the server stops
+    Per cankao.md: ollama 0.10+ exposes thinking via the `thinking`
+    field on each NDJSON chunk; the actual answer arrives in `response`.
+    We close the connection as soon as both are seen so the server stops
     decoding early and the probe doesn't pay for a full generation.
+
+    Only invoked when `spec.thinking=true` — we trust the config that
+    the model can think, so probe failures (including the famous
+    Ollama-0.10 `HTTP 400 "does not support thinking"`) just degrade
+    `thinking_ttft_seconds` to 0; they don't change `has_thinking`.
     """
     payload = {
         "model": model,
@@ -195,10 +198,9 @@ def _measure_ollama_streaming_ttfts(url: str, model: str, prompt: str,
                     break
                 if chunk.get("done"):
                     break
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
-        log.warning("ollama streaming ttft probe failed: %s", exc)
     except Exception as exc:  # noqa: BLE001
-        log.warning("ollama streaming ttft probe raised: %s", exc)
+        log.warning("ollama streaming ttft probe failed: %s", exc)
+        return None, None
 
     return thinking_ttft, answer_ttft
 
@@ -211,13 +213,12 @@ def benchmark_prompt_ollama(url: str, model: str, prompt: str,
     """One non-streaming /api/generate call. Decode server-reported
     durations (nanoseconds) into the unified QuestionResult shape.
 
-    When `thinking=True`, send an additional streaming probe with
-    `think:true` and capture the first reasoning token time
-    (`thinking_ttft_seconds`). The connection is closed as soon as both
-    first thinking and first response chunks are observed.
-
-    For non-thinking models `thinking_ttft_seconds` mirrors `ttft_seconds`
-    (per request: "若模型不带thinking能力，那么设置这一列和现有的TTFT值相同即可").
+    `thinking` is the per-model `spec.thinking` config flag, echoed
+    onto `QuestionResult.has_thinking`. When True, an extra streaming
+    probe runs with `think:true` and fills `thinking_ttft_seconds`
+    from the first reasoning chunk. When False, no extra probe runs
+    and `thinking_ttft_seconds` is left at 0 (rendered as `—` in the
+    email).
     """
     payload = {"model": model, "prompt": prompt, "stream": False}
     started = time.perf_counter()
@@ -232,6 +233,7 @@ def benchmark_prompt_ollama(url: str, model: str, prompt: str,
         return QuestionResult(
             prompt=prompt, ok=False, error=msg,
             wall_seconds=round(time.perf_counter() - started, 3),
+            has_thinking=thinking,
         )
     wall = time.perf_counter() - started
 
@@ -243,11 +245,8 @@ def benchmark_prompt_ollama(url: str, model: str, prompt: str,
     total = body.get("total_duration", 0) / 1e9
 
     ttft_seconds = round(load + prompt_eval, 3)
-    thinking_ttft_seconds = ttft_seconds
-
+    thinking_ttft_seconds = 0.0
     if thinking:
-        # Streaming probe with think=true captures the FIRST reasoning
-        # token (= "思考中第一个 token 出来的时间").
         think_ttft, _ = _measure_ollama_streaming_ttfts(
             url, model, prompt, request_timeout=request_timeout)
         if think_ttft is not None:
@@ -260,6 +259,7 @@ def benchmark_prompt_ollama(url: str, model: str, prompt: str,
         wall_seconds=round(wall, 3),
         ttft_seconds=ttft_seconds,
         thinking_ttft_seconds=thinking_ttft_seconds,
+        has_thinking=thinking,
         load_seconds=round(load, 3),
         prompt_eval_seconds=round(prompt_eval, 3),
         eval_count=eval_count,

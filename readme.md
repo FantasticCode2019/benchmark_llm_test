@@ -1,6 +1,6 @@
 # llm_bench — Olares LLM 基准测试
 
-一个**端到端、可被 cron 触发的 LLM 基准测试脚本**，用来批量评估 Olares 上以 Ollama / vLLM / LLaMA.cpp chart 形式部署的大模型。仅依赖 Python 3.9+ 标准库（`urllib` / `subprocess` / `smtplib` / `json` 等），无需 `pip install`。
+一个**端到端、可被 cron 触发的 LLM 基准测试脚本**，用来批量评估 Olares 上以 Ollama / vLLM / LLaMA.cpp chart 形式部署的大模型。运行环境基于 Python 3.9+，绝大部分功能直接用标准库（`urllib` / `subprocess` / `smtplib` / `json` 等）；vLLM 的 thinking 探针走官方 `openai` SDK（`pip install -r requirement.txt`，建议先 `python3 -m venv venv && source venv/bin/activate`）。
 
 ---
 
@@ -75,8 +75,8 @@ benchmark_llm_test/
 │   ├── readiness.py                 #   wait_until_api_ready（ollama: /api/progress→/health；vllm: /cfg→/progress(SSE)→/ping）
 │   ├── orchestrator.py              #   bench_model() 单模型流水线
 │   └── benchmark/
-│       ├── ollama.py                #     /api/generate
-│       └── openai.py                #     /v1/chat/completions + TTFT 近似 + 配置合并
+│       ├── ollama.py                #     /api/generate（+ spec.thinking=true 时再发一个流式 think:true 探针）
+│       └── openai.py                #     /v1/chat/completions + max_tokens=1 TTFT 近似（spec.thinking=true 时改走流式 chat_template_kwargs.thinking 探针，openai SDK）
 ├── data/                            # 输入输出
 │   ├── config.py                    #   load_config + setup_logging
 │   ├── html_report.py               #   render_html
@@ -105,7 +105,7 @@ benchmark_llm_test/
 | 推理端点 | `/api/generate`（stream=false） | `/v1/chat/completions`（stream=false） |
 | 下载进度查询 | `/api/progress`（无 query string，plain JSON snapshot） | `/cfg → /progress?id=<jobId>`（SSE 流） |
 | 就绪健康检查 | `/health`，**只看 HTTP 2xx**（body 不解析） | `/cfg.probeUrl` → 默认 `/ping`，**只看 HTTP 2xx** |
-| TTFT | server 精确：`load_duration + prompt_eval_duration` | 近似：单独发一个 `max_tokens=1` 请求测 round-trip |
+| TTFT | server 精确：`load_duration + prompt_eval_duration` | `spec.thinking=true` 时取流式探针的首个 `delta.content`；其它走 `max_tokens=1` round-trip 近似 |
 | TPS | server 精确：`eval_count / eval_duration` | llama.cpp 有 `timings` 时用 server TPS；否则 client end-to-end |
 | token 数 | server 报 `eval_count` / `prompt_eval_count` | `usage.completion_tokens`；缺失时按字符兜底估算 |
 | 采样参数 | 不支持 | `max_tokens` / `temperature` / `top_p` / `extra_body` 等通过 `openai_defaults` + per-model `openai` 块配 |
@@ -119,7 +119,8 @@ benchmark_llm_test/
 |---|---|---|---|
 | `wall_seconds` | ✓ | ✓ | 客户端端到端 round-trip |
 | `ttft_seconds` | server 精确 | `spec.thinking=true` 时取流式探针的 first-content delta；否则 max_tokens=1 近似 | "思考之后" 的首个回答 token 时间。带 thinking 的模型代表 reasoning trace 结束后开始吐 `content` 的时刻 |
-| `thinking_ttft_seconds` | `spec.thinking=true` 时由 `stream=true,think=true` 探针测；否则镜像 `ttft_seconds` | 同 ollama，但读 `delta.reasoning` / `delta.reasoning_content` | "思考中" 第一个 token 出现时间。普通模型自动等于 `ttft_seconds`，邮件表里同列就和 TTFT 一致 |
+| `thinking_ttft_seconds` | `spec.thinking=true` 时由 `stream=true,think=true` 探针的首个 thinking 块时间填；否则 0 | `spec.thinking=true` 时由 `chat_template_kwargs.thinking=true` 流式探针的首个 `delta.reasoning` / `delta.reasoning_content` 填；否则 0 | "思考中" 第一个 token 时间。`spec.thinking=false` 或探针没拿到 reasoning 块时为 0（邮件里显示 `—`） |
+| `has_thinking` | 直接回写 `spec.thinking` | 直接回写 `spec.thinking` | bool，**完全由配置决定**，不做运行时检测。邮件表里聚合成 `Has Think` 列的 `Yes` / `No` |
 | `eval_count` | server 报 | `usage.completion_tokens` 或字符估算 | 生成的 token 数 |
 | `eval_seconds` | server 报 | llama.cpp `timings.predicted_ms` 才有 | decode 用时 |
 | `tps` | server decode-only | server（llama.cpp）或 client（vLLM） | 主要 TPS 指标 |
@@ -173,7 +174,7 @@ benchmark_llm_test/
 | `save_pod_logs_on_failure` | `true` | 模型流程失败（install/readiness/benchmark/uninstall 任一阶段报错，或 chart 起来了但所有 prompt 都失败）时，把 `/var/log/pods/*<app_name>*` 这些目录 `tar -czf` 成 `<pod_logs_dir>/<app>_logs_<UTCstamp>.tar.gz`。**uninstall 之前**就归档（uninstall 会把 pod 一并清掉）。归档路径会写进 JSON 的 `pod_logs_archive` 字段，HTML 报表对应行的红色副标题里也会显示 |
 | `pod_logs_dir` | `/tmp` | 归档 tarball 的输出目录，自动创建 |
 | `sudo_password` | `""` | `/var/log/pods/` 在大多数 Olares 主机上是 root-only。脚本以非 root 跑时填这里：归档会自动改走 `sudo -S tar`（密码经 stdin 注入，**不**进 argv、**不**入日志），完事后 `sudo chown` 把 tarball 物归原主。**安全提示**：这是明文密码，建议把 config 文件 `chmod 600` 并加进 `.gitignore`；若以 root 直接跑或 `/var/log/pods` 已经放开了读权限，留空即可，归档走普通 `tar`。 |
-| `thinking` | `false` | 模型带「思考 / reasoning」阶段时设为 true：脚本会在每条 prompt 上额外发一个流式探针（ollama 走 `stream=true,think=true` /api/generate；openai 走 `stream=true` /v1/chat/completions），只读到第一个 reasoning delta + 第一个 content delta 就主动断开，分别填进 `thinking_ttft_seconds` 和 `ttft_seconds`。普通模型保持 `false` 即可，`thinking_ttft_seconds` 自动镜像 `ttft_seconds`（邮件里 Think TTFT 列等于 TTFT 列） |
+| `thinking` | `false` | 模型带「思考 / reasoning」阶段时设为 true（DeepSeek-R1 / Qwen3 / GPT-OSS / o1-style 这类）：脚本会在每条 prompt 上额外发一个流式探针（ollama 走 `stream=true,think=true` /api/generate；openai 走 `stream=true` /v1/chat/completions + `extra_body.chat_template_kwargs.thinking=true`），只读到第一个 reasoning delta + 第一个 content delta 就主动断开，分别填进 `thinking_ttft_seconds` 和 `ttft_seconds`。**`has_thinking` 直接回写本字段**，邮件 `Has Think` 列也直接由它决定，不做运行时检测 |
 | `openai_defaults` | 见下表 | 全局 openai-shape 采样参数 |
 | `email` | **必填** | SMTP 配置，见下表 |
 
@@ -190,7 +191,7 @@ vLLM / LLaMA.cpp / 其他 OpenAI-compatible 后端共用的默认参数。每个
 | `top_p` | `null` | nucleus 采样；`null` 表示不发 |
 | `extra_headers` | `{}` | 整体合并进请求头 |
 | `extra_body` | `{}` | 整体合并进 payload，例如 `{"top_k":50,"repetition_penalty":1.05}` |
-| `measure_ttft_approx` | `true` | true 时在每条 prompt 前先发一个 `max_tokens=1` 请求测 round-trip 近似 TTFT（stream=false 拿不到真 TTFT） |
+| `measure_ttft_approx` | `true` | true 时在每条 prompt 前先测 TTFT：`spec.thinking=true` 走流式探针（首个 `delta.content` → `ttft_seconds`、首个 `delta.reasoning` → `thinking_ttft_seconds`），失败则退到 `max_tokens=1` round-trip；`spec.thinking=false` 直接走 `max_tokens=1`。**false 时整段跳过**：`ttft_seconds=0` |
 
 ### `email` 子对象（必填）
 

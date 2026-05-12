@@ -48,9 +48,15 @@ class QuestionResult:
         (after the reasoning trace ends).
       - `thinking_ttft_seconds` is the time the model takes to emit its
         FIRST reasoning/thinking token (Ollama `message.thinking`,
-        vLLM `delta.reasoning` / `delta.reasoning_content`). Captured
-        via a single streaming probe when `spec.thinking=true`. For
-        models without a thinking phase this mirrors `ttft_seconds`.
+        vLLM `delta.reasoning` / `delta.reasoning_content`). Only
+        measured when `spec.thinking=true` in the config — we trust
+        the user to know whether the model has a thinking phase. For
+        non-thinking models (or when the streaming probe failed) it
+        is left at 0.0 (rendered as `—` in the email).
+      - `has_thinking`: ECHOED FROM `spec.thinking` in the config.
+        Set on every prompt of the run so the JSON attachment still
+        carries the per-row signal even though it's now uniform per
+        model.
     """
     prompt: str
     ok: bool = False
@@ -59,6 +65,7 @@ class QuestionResult:
     wall_seconds: float = 0.0
     ttft_seconds: float = 0.0
     thinking_ttft_seconds: float = 0.0
+    has_thinking: bool = False
     load_seconds: float = 0.0
     prompt_eval_seconds: float = 0.0
     eval_count: int = 0
@@ -99,3 +106,15 @@ class ModelResult:
     def avg(self, attr: str) -> float:
         ok = [getattr(q, attr) for q in self.questions if q.ok]
         return (sum(ok) / len(ok)) if ok else 0.0
+
+    def has_thinking_label(self) -> str:
+        """"Yes" / "No" for the email column, derived from the
+        per-prompt `has_thinking` flag (which is just the echo of
+        `spec.thinking` from the config). We pick the first ok row's
+        flag — they all agree because the value comes straight from
+        the same per-model config knob.
+        """
+        for q in self.questions:
+            if q.ok:
+                return "Yes" if q.has_thinking else "No"
+        return "No"
