@@ -72,6 +72,18 @@ def render_html(results: list) -> str:
         else:
             tail = "uninstall n/a"
         sub = f"{html_escape(decision)} · install {install_s:.0f}s · {tail}"
+        # Surface saved pod-log archive path on the same row, in red, so
+        # an on-call can scp it without digging through the JSON.
+        logs_line = ""
+        if r.pod_logs_archive:
+            logs_line = (
+                '<div style="color:#c0392b;font-size:11px;margin-top:2px">'
+                'pod logs: '
+                f'<code style="background:#fdecea;padding:0 4px;'
+                f'border-radius:3px;font-family:SFMono-Regular,Consolas,'
+                f'Menlo,monospace">{html_escape(r.pod_logs_archive)}</code>'
+                '</div>'
+            )
 
         ttft_nt_avg = r.avg("ttft_no_think_seconds")
         ttft_nt_cell = (f"{ttft_nt_avg:.2f}" if ttft_nt_avg
@@ -84,6 +96,7 @@ def render_html(results: list) -> str:
             f'{html_escape(r.app_name)}</div>'
             f'<div style="color:#888;font-size:11px;margin-top:2px">'
             f'{sub}</div>'
+            f'{logs_line}'
             f'</td>'
             f'<td style="{cell_l}">'
             f'<code style="background:#f3f4f6;padding:1px 6px;'

@@ -18,6 +18,9 @@
   "uninstall_after_run": true,
   "cooldown_seconds": 30,
   "output_dir": "/home/olares/test",
+  "save_pod_logs_on_failure": true,
+  "pod_logs_dir": "/tmp",
+  "sudo_password": "",
 
   "openai_defaults": {
     "api_key": "EMPTY",

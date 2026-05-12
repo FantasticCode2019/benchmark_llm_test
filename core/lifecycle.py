@@ -3,10 +3,14 @@ that drive ensure_installed's reuse-vs-reinstall decision.
 """
 from __future__ import annotations
 
+import glob
 import json
 import logging
+import os
+import re
 import subprocess
-from typing import Optional
+from datetime import datetime
+from typing import List, Optional
 
 from utils.cli_runner import cli, run
 
@@ -138,3 +142,148 @@ def ensure_installed(app: str, *, install_minutes: int,
         log.warning("pre-install uninstall failed (continuing): %s", exc)
     market_install(app, watch_minutes=install_minutes, envs=install_envs)
     return (False, "recovered")
+
+
+# Olares chart names are always lowercase alphanumeric (see
+# market/<app>/Chart.yaml). We refuse to interpolate anything else into
+# the `sh -c "ls -d /var/log/pods/*<app>*"` string used by the sudo
+# discovery path — a config-derived value is still external input.
+_SAFE_APP_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _sudo_run(argv: List[str], sudo_password: str, *,
+              timeout: int = 30) -> subprocess.CompletedProcess:
+    """`sudo -S -p '' <argv>` with the password fed via stdin.
+
+    `-S` makes sudo read the password from stdin; `-p ''` suppresses
+    the prompt so it doesn't end up on the shared stderr stream where
+    a leaked log capture might pick it up. The password itself is
+    passed through `input=` and never substituted into the argv.
+    """
+    return subprocess.run(
+        ["sudo", "-S", "-p", "", *argv],
+        input=sudo_password + "\n",
+        capture_output=True, text=True,
+        timeout=timeout, check=False,
+    )
+
+
+def _list_pod_dirs(app: str, sudo_password: Optional[str]) -> List[str]:
+    """Find `/var/log/pods/*<app>*` entries.
+
+    Without sudo: `glob.glob` (works iff /var/log/pods/ is at least
+    +rx for the current user; common on plain k3s, not always on
+    locked-down hosts).
+
+    With sudo: shell-out via `sh -c 'ls -d <pattern>'` — we have to
+    use a shell so the wildcard expands as root, but the app name is
+    pre-validated against `_SAFE_APP_RE` so nothing dangerous can land
+    in that string.
+    """
+    if sudo_password:
+        if not _SAFE_APP_RE.match(app):
+            log.warning("archive_pod_logs: refusing sudo glob for unsafe "
+                        "app name %r (must match %s)",
+                        app, _SAFE_APP_RE.pattern)
+            return []
+        proc = _sudo_run(
+            ["sh", "-c", f"ls -d /var/log/pods/*{app}* 2>/dev/null || true"],
+            sudo_password, timeout=15,
+        )
+        if proc.returncode != 0:
+            log.warning("archive_pod_logs %s: sudo ls failed (rc=%d, "
+                        "stderr=%s)",
+                        app, proc.returncode,
+                        (proc.stderr or "").strip()[:300])
+            return []
+        return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    return sorted(glob.glob(f"/var/log/pods/*{app}*"))
+
+
+def archive_pod_logs(app: str, *, output_dir: str = "/tmp",
+                     timeout: int = 120,
+                     sudo_password: Optional[str] = None) -> Optional[str]:
+    """Tar+gzip every `/var/log/pods/*<app>*` directory into
+    `<output_dir>/<app>_logs_<UTCstamp>.tar.gz` and return the archive
+    path. Returns None when there's nothing to archive (no matching
+    pods) or when tar fails.
+
+    Modes:
+      - `sudo_password=None` (default): runs glob + tar as the current
+        user. Works on hosts where /var/log/pods/ is world-readable
+        (or when this script is already root).
+      - `sudo_password=<str>`: every privileged step (`ls`, `tar`,
+        `chown` to hand the tarball back to us) goes through `sudo -S`
+        with the password fed on stdin. The password never appears on
+        the argv vector, in env, or in any log line.
+
+    Implementation notes:
+      - The app name is validated against `_SAFE_APP_RE` before it can
+        reach a shell glob, so a config-derived value can't escape.
+      - `/var/log/pods/<pod>` are usually symlinks to the live container
+        log dirs; tar follows them by default → we get the actual logs.
+    """
+    matches = _list_pod_dirs(app, sudo_password)
+    if not matches:
+        log.info("archive_pod_logs %s: no pods match /var/log/pods/*%s* "
+                 "(nothing to archive)", app, app)
+        return None
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as exc:
+        log.warning("archive_pod_logs %s: cannot create %s: %s",
+                    app, output_dir, exc)
+        return None
+
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    archive = os.path.join(output_dir, f"{app}_logs_{stamp}.tar.gz")
+    log.info("archiving %d pod log dir(s) for %s into %s%s",
+             len(matches), app, archive,
+             " (via sudo)" if sudo_password else "")
+    try:
+        if sudo_password:
+            proc = _sudo_run(["tar", "-czf", archive, *matches],
+                             sudo_password, timeout=timeout)
+        else:
+            proc = subprocess.run(
+                ["tar", "-czf", archive, *matches],
+                capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("archive_pod_logs %s: tar invocation failed: %s",
+                    app, exc)
+        return None
+    if proc.returncode != 0:
+        log.warning("archive_pod_logs %s: tar exit %d (stderr: %s)",
+                    app, proc.returncode,
+                    (proc.stderr or "").strip()[:300])
+        # Best-effort cleanup so a later sender doesn't email a
+        # half-written tarball. If sudo wrote it, only sudo can rm it.
+        try:
+            if sudo_password:
+                _sudo_run(["rm", "-f", archive], sudo_password, timeout=10)
+            else:
+                os.remove(archive)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return None
+
+    # tar-as-root produces a root-owned tarball that the benchmark
+    # process can't email or scp without yet another sudo. Hand it back.
+    if sudo_password:
+        try:
+            chown = _sudo_run(
+                ["chown", f"{os.getuid()}:{os.getgid()}", archive],
+                sudo_password, timeout=10,
+            )
+            if chown.returncode != 0:
+                log.warning("archive_pod_logs %s: chown back failed "
+                            "(rc=%d): %s. Archive at %s is still root-owned.",
+                            app, chown.returncode,
+                            (chown.stderr or "").strip()[:200], archive)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("archive_pod_logs %s: chown back raised: %s",
+                        app, exc)
+    return archive

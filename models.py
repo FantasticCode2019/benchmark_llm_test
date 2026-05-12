@@ -89,6 +89,11 @@ class ModelResult:
     uninstall_seconds: float = 0.0
     endpoint: str = ""
     error: Optional[str] = None
+    # Set ONLY when the model run failed (install / readiness / uninstall
+    # error or no prompt succeeded) and `save_pod_logs_on_failure=true`
+    # successfully tar.gz'd the pod log directories. Path is local to
+    # the host that ran the benchmark.
+    pod_logs_archive: Optional[str] = None
     questions: list = field(default_factory=list)  # list[QuestionResult]
 
     def avg(self, attr: str) -> float:

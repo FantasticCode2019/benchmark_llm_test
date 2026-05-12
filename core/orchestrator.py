@@ -11,7 +11,7 @@ from datetime import datetime
 from core.benchmark.ollama import benchmark_prompt_ollama, pull_model_ollama
 from core.benchmark.openai import benchmark_prompt_openai, openai_config_from
 from core.entrance import ensure_entrance_public, find_entrance
-from core.lifecycle import ensure_installed, market_uninstall
+from core.lifecycle import archive_pod_logs, ensure_installed, market_uninstall
 from core.readiness import wait_until_api_ready
 from models import ModelResult
 from utils.cli_runner import cli
@@ -64,6 +64,16 @@ def bench_model(spec: dict, prompts: list, cfg: dict) -> ModelResult:
         _opt(spec, cfg, "thinking_disable_payload", None) or None)
     thinking_disable_extra_body = (
         _opt(spec, cfg, "thinking_disable_extra_body", None) or None)
+    # On failure (install/readiness/benchmark/uninstall), tar+gzip
+    # /var/log/pods/*<app>* into pod_logs_dir so we can grep the chart's
+    # init/launcher container output post-mortem. Disabled by setting
+    # `save_pod_logs_on_failure: false`. When `sudo_password` is set
+    # (top-level only — never per-model, to keep the secret in one
+    # place), the archive helper switches to `sudo -S` so the tarball
+    # captures root-owned pod log dirs even on a non-root run.
+    save_pod_logs = bool(_opt(spec, cfg, "save_pod_logs_on_failure", True))
+    pod_logs_dir = str(_opt(spec, cfg, "pod_logs_dir", "/tmp"))
+    sudo_password = cfg.get("sudo_password") or None
 
     already_existed = False
 
@@ -173,6 +183,22 @@ def bench_model(spec: dict, prompts: list, cfg: dict) -> ModelResult:
         res.error = str(exc)
 
     finally:
+        # Archive /var/log/pods/*<app>* BEFORE uninstall (uninstall would
+        # delete the pods and their log dirs along with them). Trigger
+        # when something went wrong: an explicit error from any earlier
+        # stage, OR the chart came up but every prompt failed.
+        any_prompt_ok = any(q.ok for q in res.questions)
+        if save_pod_logs and (res.error is not None or not any_prompt_ok):
+            try:
+                archive = archive_pod_logs(
+                    app, output_dir=pod_logs_dir,
+                    sudo_password=sudo_password)
+                if archive:
+                    res.pod_logs_archive = archive
+                    log.info("%s: pod logs saved to %s", app, archive)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s: pod log archive raised: %s", app, exc)
+
         # uninstall_after_run > preserve_if_existed > default(true)
         if not uninstall_after:
             log.info("%s: uninstall_after_run=false; skipping post-benchmark "
@@ -195,6 +221,22 @@ def bench_model(spec: dict, prompts: list, cfg: dict) -> ModelResult:
                 log.exception("uninstall %s failed", app)
                 if not res.error:
                     res.error = f"uninstall: {exc}"
+                # Uninstall failed → pods are still around; if we didn't
+                # archive yet (i.e. prompts succeeded but uninstall blew
+                # up), grab them now while we still can.
+                if save_pod_logs and res.pod_logs_archive is None:
+                    try:
+                        archive = archive_pod_logs(
+                            app, output_dir=pod_logs_dir,
+                            sudo_password=sudo_password)
+                        if archive:
+                            res.pod_logs_archive = archive
+                            log.info("%s: pod logs saved to %s "
+                                     "(post uninstall failure)",
+                                     app, archive)
+                    except Exception as exc2:  # noqa: BLE001
+                        log.warning("%s: pod log archive raised: %s",
+                                    app, exc2)
         res.finished_at = datetime.utcnow().isoformat() + "Z"
 
     return res
