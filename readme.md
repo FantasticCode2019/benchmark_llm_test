@@ -1,19 +1,6 @@
 # llm_bench — Olares LLM 基准测试
 
-> v2.0：原 2104 行的单文件 `llm_bench.py` 已按「核心逻辑 + 模型 + 数据 + 工具 + 入口」拆成扁平的 5 桶布局；顶层 `llm_bench.py` 现在 = 入口（argparse + main），不再是壳。
-
-一个**端到端、可被 cron 触发的 LLM 基准测试脚本**，用来批量评估 Olares 上以 Ollama / vLLM / LLaMA.cpp chart 形式部署的大模型。
-
-依赖：
-- Python 3.9+
-- 官方 [`openai`](https://pypi.org/project/openai/) SDK（≥1.30，用于 OpenAI-compatible 后端；Ollama 后端纯 stdlib）
-- `olares-cli` 在 PATH 中（或在配置 / `--cli-path` 里给出绝对路径）
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirement.txt
-```
+一个**端到端、可被 cron 触发的 LLM 基准测试脚本**，用来批量评估 Olares 上以 Ollama / vLLM / LLaMA.cpp chart 形式部署的大模型。仅依赖 Python 3.9+ 标准库（`urllib` / `subprocess` / `smtplib` / `json` 等），无需 `pip install`。
 
 ---
 
@@ -23,13 +10,11 @@ pip install -r requirement.txt
 
 ```text
 1. ensure_installed         core/lifecycle    检查 chart 状态 → reuse / wait / 重装
-2. find_entrance            core/entrance     拿 entrance URL，没拿到则用 ports[]+namespace 拼集群内部 URL
+2. find_entrance            core/entrance     拿 entrance URL（取不到则用 ports[]+namespace 拼集群内部 URL）
 3. ensure_entrance_public   core/entrance     authLevel != public 时自动 flip
-4. wait_until_api_ready     core/readiness    GET /api/tags 或 /v1/models 等模型真正加载好
-5. pull_model_ollama (opt)  core/benchmark    仅 ollama+pull_model:true 时主动调 /api/pull
-6. warmup_until_ok          core/readiness    发一次小请求把模型装进显存（带重试）
-7. 串行跑 questions[]        core/benchmark    ollama→/api/generate；openai→/v1/chat/completions
-8. uninstall                core/lifecycle    默认 uninstall_after_run=true 腾 GPU/磁盘
+4. wait_until_api_ready     core/readiness    ollama: /api/progress→/health；vllm: /cfg→/progress?id→/ping
+5. 串行跑 questions[]        core/benchmark    ollama→/api/generate；openai→/v1/chat/completions
+6. uninstall                core/lifecycle    默认 uninstall_after_run=true 腾 GPU/磁盘
 ```
 
 跑完所有模型后：
@@ -39,56 +24,92 @@ pip install -r requirement.txt
 
 ---
 
+## bundle 就绪流程（核心）
+
+`wait_until_api_ready` 不再轮询 `/api/tags` 或 `/v1/models`。两条 backend 的就绪协议完全独立：
+
+### Ollama 分支（极简：无 /cfg、无 jobId）
+
+1. `GET <entrance>/api/progress`（**直接调，没有 query string**）每 2s 轮询一次，body 是 plain JSON snapshot：
+   ```json
+   { "app_url": "https://….olares.cn", "status": "completed",
+     "model_name": "minicpm-v:8b", "progress": 100, "speed_bps": 1305321903.7,
+     "duration": 46, "completed": 0, "completed_at": 1778505406,
+     "timestamp": 1778505441, "total": 0 }
+   ```
+   - 成功终态：`completed` / `success`
+   - 失败终态：`error`（抛 RuntimeError 透传 `err`）、`unavailable`（ollama 不可达 或 模型被删）
+   - 其它（`starting` / `waiting` / `checking` / `pulling manifest` / `pulling <digest>` / `downloading` / `verifying` / `verifying sha256 digest` / `writing manifest` / `removing any unused layers` / `hashing` / `pushing_blob` / `blob_pushed` / `creating`）→ 打 INFO 进度日志（带原始 JSON body）继续轮询
+2. `GET <entrance>/health` 每 2s 轮询 —— **任何 HTTP 2xx 即放行**，不解析 body。chart 还没起 / Authelia 没翻 / 模型还在加载时收到的 400 / 404 / 503 等都打 INFO 带截断的原始 body 然后继续重试。
+
+### vLLM 分支（bundle 协议：/cfg → /progress?id → /ping）
+
+1. `GET <entrance>/cfg` → 两种形态都接受：
+   - 单 job：`{ jobId, probeUrl, probeIntervalMs, modelName, repo, ref, appUrl }`（直接用顶层 `jobId`）
+   - 多 task：`{ tasks:[{jobId,repo,ref,file,outDir}, ...], jobIds:[...], probeUrl, probeIntervalMs }`（按下面规则匹配）
+2. **从配置的 `model_name` 找到对应 task 的 `jobId`**：
+   - 顶层有 `jobId` → 直接用，**不做模型名匹配**
+   - 仅 1 个 task → 直接用
+   - 多 task → 按 `task.repo` / `task.file` / `task.jobId` / `"<repo>/<file>"` 精确匹配 → 大小写不敏感匹配 → 子串匹配（带 WARNING）
+   - 都不匹配 → 抛 RuntimeError 并 dump 完整 cfg
+3. `GET <entrance>/progress?id=<jobId>` 按 `probeIntervalMs` 轮询。响应是 **SSE 格式**（`data: {json}` 一行一个事件，取最后一个事件作为当前状态）：
+   - 成功终态：`done`
+   - 失败终态：`error`（抛 RuntimeError 透传 `err`）
+   - 其它（`queued` / `running`）→ 打 INFO 进度日志（带原始 JSON body）继续轮询
+4. `GET <entrance><probeUrl, 默认 /ping>` 按 `probeIntervalMs` 轮询 —— **任何 HTTP 2xx 即放行**，不解析 body（`pong` / `{}` / `{"status":"ok"}` 都接受）。`probeUrl` 既可以是相对路径，也可以是绝对 URL（自动识别）。
+5. 加载完成后一次性 `GET <entrance>/v1/models`，把 `data[0].id` 作为 served name 回填到报告（vLLM 实际 serve 的名字可能跟 HF repo 不一致）。
+
+> 截止时间统一受 `api_ready_timeout_minutes` 控制（默认 60 分钟）。失败重试（transport / 非 2xx / 非 JSON / 非 SSE）固定 5 秒退避，跟成功路径的轮询间隔分开。
+
+---
+
 ## 项目布局
 
 ```text
 benchmark_llm_test/
-├── llm_bench.py                     # 入口：argparse + main() + 主循环（直接 python3 跑）
-├── models.py                        # 模型   QuestionResult / ModelResult / OpenAIConfig
+├── llm_bench.py                     # 入口：argparse + main() + 主循环
+├── models.py                        # QuestionResult / ModelResult / OpenAIConfig
 ├── core/                            # 核心逻辑
 │   ├── lifecycle.py                 #   chart 装/卸 + ensure_installed + 状态桶
 │   ├── entrance.py                  #   entrance 发现 + auth 翻转
-│   ├── readiness.py                 #   wait_until_api_ready + warmup_until_ok
+│   ├── readiness.py                 #   wait_until_api_ready（ollama: /api/progress→/health；vllm: /cfg→/progress(SSE)→/ping）
 │   ├── orchestrator.py              #   bench_model() 单模型流水线
 │   └── benchmark/
-│       ├── ollama.py                #     /api/pull + /api/generate
+│       ├── ollama.py                #     /api/generate
 │       └── openai.py                #     /v1/chat/completions + TTFT 近似 + 配置合并
-├── data/                            # 数据
+├── data/                            # 输入输出
 │   ├── config.py                    #   load_config + setup_logging
 │   ├── html_report.py               #   render_html
 │   ├── report_writer.py             #   写 JSON + HTML
 │   ├── mailer.py                    #   SMTP（implicit TLS / STARTTLS 自动判断 + 重试）
 │   └── probe.py                     #   --probe：只 dump chart env 需求
-├── utils/                           # 工具
+├── utils/                           # 通用工具
 │   ├── cli_runner.py                #   olares-cli subprocess 封装
-│   ├── http.py                      #   urllib 封装 + OpenAIHTTPError + auth_hint
+│   ├── http.py                      #   urllib 封装 + bundle helpers + OpenAIHTTPError
 │   ├── format.py                    #   human_bytes + fmt_duration
 │   └── tokens.py                    #   rough_token_count + ms_to_seconds
-├── config.example.json              # 简化样例（无注释字段）
-├── 2.json                           # 你的工作配置（带 _comment_*，本脚本会忽略）
+├── config.example.json              # 最小可用样例
+├── 2.json                           # 工作配置示例（全模型列表）
 ├── readme.md                        # 本文
-├── cmd.md                           # olares-cli 命令速查
-└── asset/
+└── cmd.md                           # olares-cli 命令速查
 ```
-
-子模块之间使用相对裸导入（`from utils.cli_runner import cli` / `from core.orchestrator import bench_model`），跑脚本时 Python 自动把 `llm_bench.py` 所在目录加到 `sys.path`，所以不需要再有 `__init__.py` 顶层包标记。
 
 ---
 
 ## 两条 backend 的差异
 
-`api_type` 字段决定走哪条路径：
+`api_type` 决定走哪条路径：
 
 | 维度 | `ollama`（默认） | `openai`（vLLM / llama.cpp / 其他 OAI-compat） |
 |---|---|---|
-| 端点 | `/api/generate`（也支持 `/api/chat`） | `/v1/chat/completions`（或 `/v1/completions`） |
-| stream | `false`，server 一次性返回完整 JSON | `false`（强制；改 true 会破坏 JSON 解析） |
-| TTFT | 精确：`load_duration + prompt_eval_duration` | 近似：单独发一个 `max_tokens=1` 的请求测 round-trip |
-| TPS | 精确：`eval_count / eval_duration`（decode-only） | llama.cpp 有 `timings` 块时取 server TPS；否则退化为 client end-to-end TPS |
-| token 数 | server 报 `eval_count` / `prompt_eval_count` | `usage.completion_tokens` 等；缺失时按字符兜底估算 |
-| 模型权重 | chart launcher 自动 pull；可设 `pull_model:true` 主动调 `/api/pull` 看进度 | chart 自带权重，配置里 `pull_model:false` |
-| 可调采样参数 | 仅 prompt + stream | `max_tokens` / `temperature` / `top_p` / `extra_body` 等通过 `openai_defaults` + per-model `openai` 块配 |
-| Auth 头 | 不发 | `Bearer <api_key>`（默认 `EMPTY` / 空 = 不发，跟 curl 行为一致） |
+| 推理端点 | `/api/generate`（stream=false） | `/v1/chat/completions`（stream=false） |
+| 下载进度查询 | `/api/progress`（无 query string，plain JSON snapshot） | `/cfg → /progress?id=<jobId>`（SSE 流） |
+| 就绪健康检查 | `/health`，**只看 HTTP 2xx**（body 不解析） | `/cfg.probeUrl` → 默认 `/ping`，**只看 HTTP 2xx** |
+| TTFT | server 精确：`load_duration + prompt_eval_duration` | 近似：单独发一个 `max_tokens=1` 请求测 round-trip |
+| TPS | server 精确：`eval_count / eval_duration` | llama.cpp 有 `timings` 时用 server TPS；否则 client end-to-end |
+| token 数 | server 报 `eval_count` / `prompt_eval_count` | `usage.completion_tokens`；缺失时按字符兜底估算 |
+| 采样参数 | 不支持 | `max_tokens` / `temperature` / `top_p` / `extra_body` 等通过 `openai_defaults` + per-model `openai` 块配 |
+| Auth 头 | 不发 | `Bearer <api_key>`（默认 `EMPTY` / 空 = 不发，跟 curl 一致） |
 
 ---
 
@@ -97,7 +118,8 @@ benchmark_llm_test/
 | 字段 | ollama | openai | 含义 |
 |---|---|---|---|
 | `wall_seconds` | ✓ | ✓ | 客户端端到端 round-trip |
-| `ttft_seconds` | server 精确 | max_tokens=1 近似 | 第一个 token 出现时间 |
+| `ttft_seconds` | server 精确 | max_tokens=1 近似 | 第一个 token 出现时间（带模型默认 thinking 的） |
+| `ttft_no_think_seconds` | server 精确 | max_tokens=1 近似 | **仅 `spec.thinking=true` 时填充**：关闭思考后的首 token 时间，用来对比 reasoning 模型的"用户感知首 token" |
 | `eval_count` | server 报 | `usage.completion_tokens` 或字符估算 | 生成的 token 数 |
 | `eval_seconds` | server 报 | llama.cpp `timings.predicted_ms` 才有 | decode 用时 |
 | `tps` | server decode-only | server（llama.cpp）或 client（vLLM） | 主要 TPS 指标 |
@@ -113,30 +135,24 @@ benchmark_llm_test/
 
 ## 运行依赖
 
-1. **Python 环境**：
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install -r requirement.txt   # 仅一个包：openai>=1.30
-   ```
-2. **olares-cli 已经登录过**：脚本通过 subprocess 调 `olares-cli`，CLI 内部会从 `~/.olares-cli/config.json` 读 profile 元数据 + 从 OS keychain 读 access/refresh token：
+1. **olares-cli 已经登录过**：脚本通过 subprocess 调 `olares-cli`，CLI 内部会从 `~/.olares-cli/config.json` 读 profile 元数据 + 从 OS keychain 读 access/refresh token：
    ```bash
    olares-cli profile login --olares-id <id>
    # 或非交互式：
    olares-cli profile import --olares-id <id> --refresh-token <tok>
    ```
    cron 场景注意 `HOME` / macOS keychain unlock 这两个坑，详见 `cmd.md`。
-3. **HuggingFace token 已配（vLLM 系列必用）**：
+2. **HuggingFace token 已配（vLLM 系列必用）**：
    ```bash
    olares-cli settings advanced env user set --var OLARES_USER_HUGGINGFACE_TOKEN=hf_xxx
    ```
-4. **olares-cli 二进制路径可配**：`--cli-path /home/olares/test/olares-cli` 或 config 里 `"cli_path": "..."`，默认从 PATH 找 `olares-cli`。
+3. **olares-cli 二进制路径可配**：`--cli-path /home/olares/test/olares-cli` 或 config 里 `"cli_path": "..."`，默认从 PATH 找 `olares-cli`。
 
 ---
 
 ## 配置文件参考
 
-`config.example.json` 已经精简为可直接复制即跑的最小可用版；下面是**所有**支持字段的完整说明（按出现顺序），从原 `2.json` 的注释整理而来。
+`config.example.json` 是最小可用样例。所有支持字段如下：
 
 ### 全局默认（每个 model 可同名字段覆盖）
 
@@ -146,32 +162,27 @@ benchmark_llm_test/
 | `install_timeout_minutes` | 90 | `market install --watch` 超时（分钟） |
 | `uninstall_timeout_minutes` | 30 | `market uninstall --watch` 超时（分钟） |
 | `request_timeout_seconds` | 1800 | 单次推理 HTTP 请求超时（秒） |
-| `pull_timeout_seconds` | 3600 | `/api/pull` + warmup 的请求超时（秒） |
-| `api_ready_timeout_minutes` | 60 | chart 进入 running 后，轮询后端 `/api/tags`（ollama）或 `/v1/models`（openai）直到目标模型上线，最长等多少分钟。这是 `wait_until_api_ready` 等价于 chart launcher UI 上"Waiting for Ollama → Ready to chat"的判据 |
-| `api_ready_probe_interval_seconds` | 30 | 上面的轮询每次失败 sleep 多少秒 |
-| `warmup_retries` | 10 | warmup（小推理请求）最多重试几次。覆盖 KV cache init / lazy CUDA compile / Modelfile 重量化 / vLLM scheduler warmup 等懒初始化 |
-| `warmup_retry_sleep_seconds` | 30 | warmup 每次失败 sleep 多少秒。默认 10×30s ≈ 5 分钟 |
-| `pull_max_attempts` | 5 | `/api/pull` transport 失败最多重试几次（仅 `pull_model:true` 时用）。Ollama 服务端的拉取是幂等可断点续传，所以重连等于继续；`fatal`（manifest unknown / OOM-on-disk）不会重试 |
-| `pull_retry_sleep_seconds` | 30 | `/api/pull` 重试间隔（秒） |
+| `api_ready_timeout_minutes` | 60 | 就绪门最长等多少分钟。覆盖下载 + 模型加载两段。ollama 用固定 2s 轮询 `/api/progress` 和 `/health`；vllm 用服务端 `probeIntervalMs`；任何 backend 的失败重试都是固定 5s |
 | `delete_data` | `true` | uninstall 时是否带 `--delete-data` 释放磁盘 |
-| `pull_model` | `false` | api_type=ollama 时是否主动调 `/api/pull`。olares-market 上所有 `ollama*` chart 都自带 launcher 容器在启动时跑 `ollama pull <model>`，外面再发一遍是冗余的（双发的 HTTP keepalive 还容易撞 ingress idle timeout）。只有当你测的是裸 ollama-server（没有 chart launcher），或者想把下载进度日志打到本脚本的 stdout 时才开（per-model 也可覆盖） |
 | `auto_open_internal_entrance` | `true` | entrance 不是 public 时自动调 `auth-level set --level public` + `policy set --default-policy public`。设置 per-app，模型 uninstall 时跟着销毁，所以不会泄漏 |
-| `set_public_during_run` | `false` | legacy 别名，true 时等同 `auto_open_internal_entrance:true` |
 | `skip_install_if_running` | `true` | 已 running 的 chart 跳过 install |
 | `preserve_if_existed` | `false` | true 时仅"跑前已存在"的 chart 跑完不卸载（优先级低于 `uninstall_after_run`） |
-| `uninstall_after_run` | `true` | true（默认）：跑完一个模型立刻 uninstall，腾 GPU/磁盘给下一个；false：跑完一律保留（即使本次新装的）。下次 `skip_install_if_running` 命中可直接复用。优先级高于 `preserve_if_existed` |
-| `cooldown_seconds` | 30 | 模型之间的休眠（秒），让 GPU 显存彻底回收 |
+| `uninstall_after_run` | `true` | true（默认）：跑完一个模型立刻 uninstall，腾 GPU/磁盘给下一个；false：跑完一律保留。优先级高于 `preserve_if_existed` |
+| `cooldown_seconds` | 15 | 模型之间的休眠（秒），让 GPU 显存彻底回收 |
 | `output_dir` | config 文件所在目录 | JSON+HTML 报告输出目录，自动创建 |
+| `thinking` | `false` | 模型带「思考 / reasoning」阶段时设为 true：脚本会在每条 prompt 上再发一个 *关闭思考* 的 `max_tokens=1` 探针，把首 token 时间填进 `ttft_no_think_seconds`，方便和默认模式对比。普通模型保持 `false` 即可，那一列在 HTML 里会显示 `—` |
+| `thinking_disable_payload` | `{"think": false}` | **仅 ollama 用**：合并进 `/api/generate` 请求体来关思考。Ollama 0.10+ 支持 `think:false`，所以默认值通常够用 |
+| `thinking_disable_extra_body` | `{"chat_template_kwargs": {"enable_thinking": false}}` | **仅 openai 用**：合并进 `extra_body` 来关思考。默认值匹配 vLLM + Qwen3 / DeepSeek-R1 chat template；GPT-OSS 类用 `reasoning_effort` 时改成 `{"reasoning_effort": "none"}` |
 | `openai_defaults` | 见下表 | 全局 openai-shape 采样参数 |
 | `email` | **必填** | SMTP 配置，见下表 |
 
 ### `openai_defaults` 子对象（仅对 `api_type:openai` 生效）
 
-vLLM / LLaMA.cpp / 其他 OpenAI-compatible 后端共用的默认参数。每个 model 可以在 `openai`: {...} 块里 per-model 覆盖。脚本内部参考 `scripts/llm_api_benchmark.py` 的实现。
+vLLM / LLaMA.cpp / 其他 OpenAI-compatible 后端共用的默认参数。每个 model 可以在 `openai`: {...} 块里 per-model 覆盖。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `api_key` | `EMPTY` | llama-server 启了 `--api-key` 时填进来；vLLM/chart 内部不需要可保持 `EMPTY`（脚本会跳过 `Authorization` 头，跟 curl 行为一致） |
+| `api_key` | `EMPTY` | llama-server 启了 `--api-key` 时填进来；vLLM / chart 内部不需要可保持 `EMPTY`（脚本会跳过 `Authorization` 头，跟 curl 一致） |
 | `endpoint` | `chat` | `chat` 走 `/v1/chat/completions`；`completion` 走 `/v1/completions` |
 | `max_tokens` | 256 | 推理生成上限 |
 | `temperature` | 0.0 | 采样温度 |
@@ -188,13 +199,13 @@ Gmail 必须用 App Password（在 Google Account → Security → 2-Step Verifi
 |---|---|---|
 | `smtp_host` | — | SMTP 主机名 |
 | `smtp_port` | — | 465（implicit TLS）/ 587（STARTTLS） |
-| `use_ssl` | `port==465` | 显式覆盖；不写时用启发式：465→implicit TLS，其他→STARTTLS |
+| `use_ssl` | `port==465` | 显式覆盖；不写时按端口启发式：465→implicit TLS，其他→STARTTLS |
 | `smtp_timeout` | 120 | TCP / TLS 握手超时（秒） |
-| `smtp_retries` | 3 | 仅对 transport 错误重试；auth/protocol 错立即抛 |
+| `smtp_retries` | 3 | 仅对 transport 错误重试；auth / protocol 错立即抛 |
 | `smtp_retry_backoff` | 5 | 退避基数（秒），按 `min(backoff*attempt, 60)` 增长 |
 | `username` / `password` | — | SMTP 凭据 |
 | `from` / `to` | — | `to` 支持逗号分隔多个收件人 |
-| `subject` | `Olares LLM benchmark <date>` | 邮件主题 |
+| `subject` | `Olares LLM benchmark {date}` | 邮件主题。支持模板占位符 `{date}`（UTC 日期 `YYYY-MM-DD`）、`{datetime}`（`YYYY-MM-DD HH:MM`）、`{stamp}`（与 JSON 文件名一致的 `YYYYMMDD-HHMMSS`）。例 `"Olares LLM benchmark [{stamp}]"` |
 
 ### Per-model（最少 2 个字段）
 
@@ -208,25 +219,17 @@ Gmail 必须用 App Password（在 Google Account → Security → 2-Step Verifi
 - `entrance_name`：指定 entrance 名（多 entrance 时挑一个）
 - `endpoint_url`：直接覆盖端点 URL，**跳过 entrance 自动发现 + 跳过 auth-level 翻转**。例如 `"http://localhost:30888"`（NodePort）或 `"http://10.x.y.z:8000"`（Pod IP）
 - `envs`：数组，原样传给 `olares-cli market install --env KEY=VALUE`
-- `openai`：子对象，仅 `api_type:openai` 生效，覆盖 `openai_defaults` 里的 `api_key/endpoint/max_tokens/temperature/top_p/extra_headers/extra_body/measure_ttft_approx`
-- 上表「全局默认」中的所有字段（`install_timeout_minutes` / `delete_data` / `pull_model` / ...）
+- `openai`：子对象，仅 `api_type:openai` 生效，覆盖 `openai_defaults` 里的任意字段
+- 上表「全局默认」中的所有字段（`install_timeout_minutes` / `delete_data` / `auto_open_internal_entrance` / ...）
 
-> ⚠️ `model_name` 必须和后端实际加载的模型名**一字不差**。第一次跑前用 `python3 llm_bench.py -c <conf> --probe` 看 chart 声明，或装好后用 `ollama list`(ollama) / `curl URL/v1/models`(vllm 或 llamacpp) 取准确 ID 回填。
+> ⚠️ `model_name` 跟后端实际加载的模型名只要**互为子串**就算同一个模型（大小写不敏感），不强制一字不差。例如配置 `"Qwen3.5-4B"`、vLLM `/v1/models` 报 `"Qwen/Qwen3.5-4B-AWQ"` —— 视为兼容，保留配置值；只有完全没有子串关系（例如配置 `"qwen3"` vs 实际 `"deepseek-r1:14b"`）时才会自动覆盖成 server-reported 的值。对 vLLM 多 task 的 `/cfg` 还会被 `_find_vllm_task_for_model` 用来在 `tasks[]` 里匹配 `repo` / `file` / `repo/file` 找 jobId（单 task 或顶层 `jobId` 时不参与匹配）。第一次跑前用 `python3 llm_bench.py -c <conf> --probe` 看 chart 声明，或装好后用 `ollama list`(ollama) / `curl URL/v1/models`(vllm 或 llamacpp) 取准确 ID 回填。
 
 ### vLLM / llama.cpp 内部 entrance
 
-vLLM / llama.cpp 这类 chart 默认 `authLevel=internal`，没有公网域名。脚本会自动用 `olares-cli settings apps get <app>` 拿到 `ports[] + namespace` 拼出 cluster 内部 URL（`http://<svc>.<ns>:<port>`），从 Olares host 上一般能直接打通。如果你的环境从 host 解不到 cluster DNS，可以：
+vLLM / llama.cpp 这类 chart 默认 `authLevel=internal`，没有公网域名。脚本会自动用 `olares-cli settings apps get <app>` 拿到 `ports[] + namespace` 拼出 cluster 内部 URL（`http://<svc>.<ns>:<port>`），从 Olares host 上一般能直接打通。如果你的环境从 host 解不到 cluster DNS：
 
 1. 在该 model 上设置 `endpoint_url` 手动指定 URL；或
-2. 打开 `auto_open_internal_entrance:true`（默认）让脚本临时把 entrance 改成 public。
-
-### 一些常见 chart 备忘（来自原 `2.json` 注释）
-
-- BGE-M3、bge-* 系列是 embedding 模型，不支持 `/api/generate`；脚本会得到 4xx 报错并标 ERR。如要 benchmark embedding 性能需要单独走 `/api/embed`，目前脚本不覆盖。
-- LLaVA 1.6、MiniCPM-V 是多模态视觉模型，本脚本只发文本 prompt 不发图片，能跑但只是普通 chat 路径。
-- Gemma4 / Qwen3.5 等非官方量化（Unsloth Dynamic Q4 等）`model_name` 多半是 chart Modelfile 里 `hf.co/<repo>` 形式，强烈建议先用 `--probe` 看 `GEMMA_MODEL` / `MODEL_NAME` 这类 env 默认值。
-- vLLM 系列需要先在 OS 配 HF token（见上面"运行依赖"第 2 条）。
-- llama.cpp 120B 模型超大，建议 `install_timeout_minutes` ≥ 240。
+2. 保留 `auto_open_internal_entrance:true`（默认）让脚本临时把 entrance 改成 public。
 
 ---
 

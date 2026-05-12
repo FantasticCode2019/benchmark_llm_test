@@ -13,6 +13,20 @@ from typing import Optional
 
 log = logging.getLogger("llm_bench")
 
+_DEFAULT_SUBJECT = "Olares LLM benchmark {date}"
+
+
+def _render_subject(template: str, stamp: str) -> str:
+    """Substitute `{date}` / `{datetime}` / `{stamp}` placeholders in
+    the configured subject. Unknown braces are left untouched (so a
+    literal `{foo}` in the subject doesn't blow up).
+    """
+    now = datetime.utcnow()
+    return (template
+            .replace("{date}", now.strftime("%Y-%m-%d"))
+            .replace("{datetime}", now.strftime("%Y-%m-%d %H:%M"))
+            .replace("{stamp}", stamp))
+
 
 def _send_once(host: str, port: int, *, timeout: int, use_ssl: bool,
                username: str, password: str, sender: str,
@@ -45,8 +59,8 @@ def send_email(html: str, json_dump: str, cfg: dict, *, stamp: str) -> None:
     """
     smtp_cfg = cfg["email"]
     msg = MIMEMultipart("mixed")
-    msg["Subject"] = smtp_cfg.get(
-        "subject", f"Olares LLM benchmark {datetime.utcnow().date()}")
+    msg["Subject"] = _render_subject(
+        smtp_cfg.get("subject") or _DEFAULT_SUBJECT, stamp)
     msg["From"] = smtp_cfg["from"]
     msg["To"] = smtp_cfg["to"]
 

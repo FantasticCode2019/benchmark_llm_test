@@ -134,8 +134,53 @@ def pull_model_ollama(url: str, model: str, *,
     )
 
 
+def _ttft_no_think_probe(url: str, model: str, prompt: str,
+                         disable_payload: Optional[dict],
+                         *, request_timeout: int) -> Optional[float]:
+    """Send one short /api/generate call with thinking disabled and read
+    `load_duration + prompt_eval_duration` from the response.
+
+    Caps generation to 1 token via `options.num_predict=1` so the probe
+    isn't a full inference (we only need the prefill timing).
+    """
+    payload: dict = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "think": False,
+        "options": {"num_predict": 1},
+    }
+    if disable_payload:
+        for k, v in disable_payload.items():
+            if k == "options" and isinstance(v, dict) \
+                    and isinstance(payload.get("options"), dict):
+                payload["options"].update(v)
+            else:
+                payload[k] = v
+    try:
+        body = http_post_json(f"{url}/api/generate", payload,
+                              timeout=request_timeout)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ttft_no_think probe failed: %s", exc)
+        return None
+    load = body.get("load_duration", 0) / 1e9
+    prompt_eval = body.get("prompt_eval_duration", 0) / 1e9
+    return load + prompt_eval
+
+
 def benchmark_prompt_ollama(url: str, model: str, prompt: str,
-                            *, request_timeout: int) -> QuestionResult:
+                            *,
+                            request_timeout: int,
+                            thinking: bool = False,
+                            thinking_disable_payload: Optional[dict] = None,
+                            ) -> QuestionResult:
+    """One non-streaming /api/generate call. Decode server-reported
+    durations (nanoseconds) into the unified QuestionResult shape.
+
+    When `thinking=True`, send an additional short probe with thinking
+    explicitly disabled (default `{"think": false}`) so we can compare
+    the ttft you'd actually see if reasoning were turned off.
+    """
     payload = {"model": model, "prompt": prompt, "stream": False}
     started = time.perf_counter()
     try:
@@ -159,12 +204,21 @@ def benchmark_prompt_ollama(url: str, model: str, prompt: str,
     eval_dur = body.get("eval_duration", 0) / 1e9
     total = body.get("total_duration", 0) / 1e9
 
+    ttft_no_think = 0.0
+    if thinking:
+        probed = _ttft_no_think_probe(url, model, prompt,
+                                      thinking_disable_payload,
+                                      request_timeout=request_timeout)
+        if probed is not None:
+            ttft_no_think = round(probed, 3)
+
     return QuestionResult(
         prompt=prompt,
         ok=True,
         response_chars=len(body.get("response", "")),
         wall_seconds=round(wall, 3),
         ttft_seconds=round(load + prompt_eval, 3),
+        ttft_no_think_seconds=ttft_no_think,
         load_seconds=round(load, 3),
         prompt_eval_seconds=round(prompt_eval, 3),
         eval_count=eval_count,

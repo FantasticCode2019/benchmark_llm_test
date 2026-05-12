@@ -8,8 +8,8 @@ from typing import Any
 
 log = logging.getLogger("llm_bench")
 
-# Set by set_cli_path() at startup; defaults to whatever the OS resolves
-# from PATH. `--cli-path` / config `cli_path` can override it.
+# Set by set_cli_path() at startup; defaults to PATH-resolved `olares-cli`.
+# `--cli-path` / config `cli_path` override at boot time.
 _CLI_PATH = "olares-cli"
 
 
@@ -36,17 +36,3 @@ def cli_json(args: list, *, timeout: int = 60) -> Any:
     proc = run([cli(), *args, "-o", "json"], timeout=timeout, capture=True)
     out = proc.stdout.strip()
     return json.loads(out) if out else None
-
-
-def apply_user_envs(user_envs: dict) -> None:
-    """Set USER-level env vars once before the install loop. Per-USER (not
-    per-app) so we write all keys in one `env user set --var KEY=VAL` call.
-    """
-    if not user_envs:
-        return
-    cmd = [cli(), "settings", "advanced", "env", "user", "set"]
-    for key, value in user_envs.items():
-        cmd.extend(["--var", f"{key}={value}"])
-    log.info("applying %d user-level env var(s): %s",
-             len(user_envs), ", ".join(user_envs.keys()))
-    run(cmd, timeout=120)

@@ -41,6 +41,16 @@ class QuestionResult:
         - total_server_seconds: equals wall_seconds
         - prompt_tokens / total_tokens / client_tps / server_tps_reported
           are populated from `usage` and `timings` blocks
+
+    Thinking (DeepSeek-R1 / Qwen3 / GPT-OSS / o1-style):
+      - `ttft_seconds` reflects the model's NATURAL behavior — for a
+        thinking model in its default mode this may include the entire
+        reasoning phase if the server doesn't surface reasoning tokens
+        as regular content (vLLM with reasoning_parser, OpenAI o1, ...).
+      - `ttft_no_think_seconds` is an OPTIONAL second probe with
+        thinking explicitly disabled (Ollama: `think:false`; vLLM/Qwen3:
+        `chat_template_kwargs.enable_thinking:false`). 0.0 means "not
+        measured" (model has no thinking, or `spec.thinking` was off).
     """
     prompt: str
     ok: bool = False
@@ -48,6 +58,7 @@ class QuestionResult:
     response_chars: int = 0
     wall_seconds: float = 0.0
     ttft_seconds: float = 0.0
+    ttft_no_think_seconds: float = 0.0
     load_seconds: float = 0.0
     prompt_eval_seconds: float = 0.0
     eval_count: int = 0

@@ -19,7 +19,7 @@ from data.config import load_config, setup_logging
 from data.mailer import send_email
 from data.probe import probe_apps
 from data.report_writer import write_reports
-from utils.cli_runner import apply_user_envs, set_cli_path
+from utils.cli_runner import set_cli_path
 
 log = logging.getLogger("llm_bench")
 
@@ -41,17 +41,12 @@ def main() -> int:
     setup_logging(args.log)
     cfg = load_config(args.config)
 
-    # CLI path resolution priority: --cli-path > config.cli_path > $PATH lookup
+    # CLI path resolution priority: --cli-path > config.cli_path > $PATH lookup.
     set_cli_path(args.cli_path or cfg.get("cli_path") or "olares-cli")
 
     if args.probe:
         probe_apps([m["app_name"] for m in cfg["models"]])
         return 0
-
-    # Legacy `user_envs` block — undocumented escape hatch. The supported
-    # path is to set user envs once via `olares-cli settings advanced env
-    # user set ...` so secrets stay out of the config file.
-    apply_user_envs(cfg.get("user_envs") or {})
 
     results = []
     for spec in cfg["models"]:

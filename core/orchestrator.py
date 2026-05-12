@@ -12,7 +12,7 @@ from core.benchmark.ollama import benchmark_prompt_ollama, pull_model_ollama
 from core.benchmark.openai import benchmark_prompt_openai, openai_config_from
 from core.entrance import ensure_entrance_public, find_entrance
 from core.lifecycle import ensure_installed, market_uninstall
-from core.readiness import wait_until_api_ready, warmup_until_ok
+from core.readiness import wait_until_api_ready
 from models import ModelResult
 from utils.cli_runner import cli
 
@@ -56,6 +56,14 @@ def bench_model(spec: dict, prompts: list, cfg: dict) -> ModelResult:
     uninstall_after = bool(_opt(spec, cfg, "uninstall_after_run", True))
     install_envs = list(spec.get("envs") or [])
     openai_conf = openai_config_from(spec, cfg)
+    # Optional second TTFT measurement with thinking explicitly disabled
+    # (DeepSeek-R1 / Qwen3 / o1-style). Per-model only — most models
+    # don't have a thinking phase to disable.
+    thinking = bool(_opt(spec, cfg, "thinking", False))
+    thinking_disable_payload = (
+        _opt(spec, cfg, "thinking_disable_payload", None) or None)
+    thinking_disable_extra_body = (
+        _opt(spec, cfg, "thinking_disable_extra_body", None) or None)
 
     already_existed = False
 
@@ -87,20 +95,25 @@ def bench_model(spec: dict, prompts: list, cfg: dict) -> ModelResult:
         # 3. flip the entrance to public if needed
         ensure_entrance_public(app, entrance, auth_level, auto_open=auto_open)
 
-        # 3.5. wait for the model to actually be served by the backend
-        # (level-1 readiness gate; same signal the chart launcher uses).
-        wait_until_api_ready(
+        # 3.5. wait for the bundle to download AND the server to load it.
+        # Returns the server-reported model name when discoverable (vLLM's
+        # /v1/models). For ollama and override scenarios it returns None
+        # and we keep using the configured `model_name` as-is.
+        discovered = wait_until_api_ready(
             url, api_type, model,
             max_wait_minutes=int(_opt(spec, cfg,
                                       "api_ready_timeout_minutes", 60)),
-            probe_interval_seconds=int(_opt(spec, cfg,
-                                            "api_ready_probe_interval_seconds",
-                                            30)),
         )
+        if discovered and discovered != model:
+            log.info("server reports served name as %r (configured %r); "
+                     "using server name for the benchmark", discovered, model)
+            model = discovered
+            res.model = discovered
 
         # 4. (opt-in) explicit /api/pull — only useful for bare ollama
-        # daemons or to surface progress in this script's stdout. Ollama's
-        # /api/pull is idempotent, so calling after step 3.5 is a no-op.
+        # daemons or to surface progress in this script's stdout. The
+        # bundle-aware chart launcher pulls automatically, so this is
+        # rarely needed; default `pull_model:false`.
         if api_type == "ollama" and do_pull:
             try:
                 pull_model_ollama(
@@ -115,35 +128,36 @@ def bench_model(spec: dict, prompts: list, cfg: dict) -> ModelResult:
                 log.warning("pull failed (model already present, "
                             "ignoring): %s", exc)
 
-        # 5. warmup with retry — level-2 readiness gate (10×30s ≈ 5 min)
-        warmup_until_ok(
-            url, model, api_type,
-            openai_conf if api_type == "openai" else None,
-            request_timeout=pull_timeout,
-            retries=int(_opt(spec, cfg, "warmup_retries", 10)),
-            sleep_seconds=int(_opt(spec, cfg,
-                                   "warmup_retry_sleep_seconds", 30)),
-        )
-
         # 6. real benchmark
         for prompt in prompts:
             log.info("prompt: %s", prompt[:60].replace("\n", " "))
             if api_type == "openai":
-                qr = benchmark_prompt_openai(url, model, prompt, openai_conf,
-                                             request_timeout=request_timeout)
+                qr = benchmark_prompt_openai(
+                    url, model, prompt, openai_conf,
+                    request_timeout=request_timeout,
+                    thinking=thinking,
+                    thinking_disable_extra_body=thinking_disable_extra_body,
+                )
             else:
-                qr = benchmark_prompt_ollama(url, model, prompt,
-                                             request_timeout=request_timeout)
+                qr = benchmark_prompt_ollama(
+                    url, model, prompt,
+                    request_timeout=request_timeout,
+                    thinking=thinking,
+                    thinking_disable_payload=thinking_disable_payload,
+                )
             res.questions.append(qr)
             if qr.ok:
+                noth = (f" ttft_noT={qr.ttft_no_think_seconds:.3f}s"
+                        if qr.ttft_no_think_seconds else "")
                 if api_type == "openai":
-                    log.info("  -> wall=%.3fs ttft~%.3fs tokens=%d tps=%.2f "
+                    log.info("  -> wall=%.3fs ttft~%.3fs%s tokens=%d tps=%.2f "
                              "(client_tps=%.2f, server_tps=%.2f)",
-                             qr.wall_seconds, qr.ttft_seconds, qr.eval_count,
-                             qr.tps, qr.client_tps, qr.server_tps_reported)
+                             qr.wall_seconds, qr.ttft_seconds, noth,
+                             qr.eval_count, qr.tps, qr.client_tps,
+                             qr.server_tps_reported)
                 else:
-                    log.info("  -> ttft=%.3fs tokens=%d tps=%.2f wall=%.3fs",
-                             qr.ttft_seconds, qr.eval_count, qr.tps,
+                    log.info("  -> ttft=%.3fs%s tokens=%d tps=%.2f wall=%.3fs",
+                             qr.ttft_seconds, noth, qr.eval_count, qr.tps,
                              qr.wall_seconds)
             else:
                 log.warning("  -> error: %s", qr.error)
