@@ -1,10 +1,10 @@
 """Render the email-friendly summary table HTML."""
 from __future__ import annotations
 
-from datetime import datetime
 from html import escape as html_escape
 
-from utils.format import fmt_duration
+from llm_bench.utils.format import fmt_duration
+from llm_bench.utils.time_utils import utc_now_naive
 
 
 def render_html(results: list) -> str:
@@ -154,7 +154,7 @@ def render_html(results: list) -> str:
         '<div style="font-size:20px;font-weight:600;color:#111;'
         'margin-bottom:2px">Olares LLM benchmark</div>'
         f'<div style="color:#666;font-size:13px">'
-        f'{datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}'
+        f'{utc_now_naive().strftime("%Y-%m-%d %H:%M UTC")}'
         f' &middot; {subtitle}</div>'
         '</div>'
         # main table — wrapped in a div so the rounded border survives

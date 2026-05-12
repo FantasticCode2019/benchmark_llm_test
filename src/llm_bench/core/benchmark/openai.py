@@ -17,21 +17,27 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional, Tuple
 
 from openai import OpenAI
 
-from models import OpenAIConfig, QuestionResult
-from utils.http import auth_hint, post_openai
-from utils.tokens import ms_to_seconds, rough_token_count, to_float
+from llm_bench.clients.openai_errors import auth_hint, post_openai
+from llm_bench.constants import LOG_NAMESPACE
+from llm_bench.domain import AppConfig, ModelSpec, OpenAIConfig, QuestionResult
+from llm_bench.utils.tokens import ms_to_seconds, rough_token_count, to_float
 
-log = logging.getLogger("llm_bench")
+log = logging.getLogger(LOG_NAMESPACE)
 
 
-def openai_config_from(spec: dict, cfg: dict) -> OpenAIConfig:
-    """Merge per-model openai overrides on top of global config defaults."""
-    g = (cfg.get("openai_defaults") or {})
-    s = (spec.get("openai") or {})
+def openai_config_from(spec: ModelSpec, cfg: AppConfig) -> OpenAIConfig:
+    """Merge per-model openai overrides on top of global ``openai_defaults``.
+
+    Layered resolution: ``spec.openai_overrides`` > ``cfg.openai_defaults``
+    > hard-coded :class:`OpenAIConfig` defaults. Each layer is a raw
+    dict so callers can sprinkle ad-hoc keys via ``extra_body`` without
+    having to update a typed schema.
+    """
+    g = cfg.openai_defaults
+    s = spec.openai_overrides
 
     def pick(key: str, default):
         if key in s:
@@ -72,7 +78,7 @@ def openai_headers(api_key: str, extra: dict) -> dict:
 
 
 def build_openai_payload(model: str, prompt: str, conf: OpenAIConfig,
-                         *, max_tokens_override: Optional[int] = None) -> dict:
+                         *, max_tokens_override: int | None = None) -> dict:
     mt = (max_tokens_override
           if max_tokens_override is not None else conf.max_tokens)
     # IMPORTANT: stream=False is REQUIRED. The whole script parses the
@@ -142,7 +148,7 @@ def _extract_openai_response(body: dict) -> dict:
 
 def _measure_openai_ttft(url: str, model: str, prompt: str,
                          conf: OpenAIConfig,
-                         *, timeout: int) -> Optional[float]:
+                         *, timeout: int) -> float | None:
     """Approximate TTFT via a max_tokens=1 round-trip. Returns None on
     failure — caller treats that as "no measurement".
     """
@@ -152,7 +158,7 @@ def _measure_openai_ttft(url: str, model: str, prompt: str,
     try:
         wall, _ = post_openai(full, payload, headers, timeout=timeout)
         return wall
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.debug("ttft probe failed: %s", exc)
         return None
 
@@ -191,7 +197,7 @@ def _make_openai_client(url: str, conf: OpenAIConfig,
     )
 
 
-def _merge_thinking_extra_body(base: Optional[dict]) -> dict:
+def _merge_thinking_extra_body(base: dict | None) -> dict:
     """Inject `chat_template_kwargs.thinking=True` into `conf.extra_body`
     one level deep so user-supplied siblings (e.g. `enable_reasoning`)
     survive. vLLM / Qwen3 / DeepSeek-R1 templates honor this key to opt
@@ -209,8 +215,8 @@ def _merge_thinking_extra_body(base: Optional[dict]) -> dict:
 def _measure_openai_streaming_ttfts(url: str, model: str, prompt: str,
                                     conf: OpenAIConfig,
                                     *, timeout: int,
-                                    ) -> Tuple[Optional[float],
-                                               Optional[float]]:
+                                    ) -> tuple[float | None,
+                                               float | None]:
     """Open ONE streaming /v1/chat/completions request via the `openai`
     SDK with `extra_body={"chat_template_kwargs": {"thinking": True}}`
     and capture both the first reasoning delta and the first content
@@ -242,8 +248,8 @@ def _measure_openai_streaming_ttfts(url: str, model: str, prompt: str,
     if conf.top_p is not None:
         kwargs["top_p"] = conf.top_p
 
-    thinking_ttft: Optional[float] = None
-    answer_ttft: Optional[float] = None
+    thinking_ttft: float | None = None
+    answer_ttft: float | None = None
     stream = None
     started = time.perf_counter()
     try:
@@ -267,7 +273,7 @@ def _measure_openai_streaming_ttfts(url: str, model: str, prompt: str,
             if (thinking_ttft is not None
                     and answer_ttft is not None):
                 break
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.warning("openai streaming ttft probe failed: %s",
                     str(exc)[:240])
         return None, None
@@ -277,7 +283,7 @@ def _measure_openai_streaming_ttfts(url: str, model: str, prompt: str,
         if stream is not None:
             try:
                 stream.close()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
     return thinking_ttft, answer_ttft
@@ -303,8 +309,8 @@ def benchmark_prompt_openai(url: str, model: str, prompt: str,
     full = openai_url(url, conf.endpoint)
     headers = openai_headers(conf.api_key, conf.extra_headers)
 
-    ttft_approx: Optional[float] = None
-    thinking_ttft: Optional[float] = None
+    ttft_approx: float | None = None
+    thinking_ttft: float | None = None
 
     if thinking and conf.measure_ttft_approx:
         # One streaming probe captures BOTH ttft and thinking_ttft.
@@ -324,7 +330,7 @@ def benchmark_prompt_openai(url: str, model: str, prompt: str,
     try:
         wall, body = post_openai(full, payload, headers,
                                  timeout=request_timeout)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         msg = str(exc)
         hint = auth_hint(exc)
         if hint:

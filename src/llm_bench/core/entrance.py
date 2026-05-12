@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
 
-from utils.cli_runner import cli, cli_json, run
+from llm_bench.constants import LOG_NAMESPACE
+from llm_bench.utils.cli_runner import cli, cli_json, run
 
-log = logging.getLogger("llm_bench")
+log = logging.getLogger(LOG_NAMESPACE)
 
 
 def _normalize_url(raw: str) -> str:
@@ -25,7 +25,7 @@ def _normalize_url(raw: str) -> str:
     return "https://" + raw
 
 
-def _cluster_url_from_ports(info: dict) -> Optional[str]:
+def _cluster_url_from_ports(info: dict) -> str | None:
     """Build an in-cluster URL from `apps get`'s ports[] + namespace.
 
     Used when the entrance has authLevel=internal (no public domain).
@@ -44,8 +44,8 @@ def _cluster_url_from_ports(info: dict) -> Optional[str]:
     return None
 
 
-def find_entrance(app: str, hint: Optional[str],
-                  *, override: Optional[str] = None):
+def find_entrance(app: str, hint: str | None,
+                  *, override: str | None = None):
     """Pick the entrance to hit. Returns (entrance_name, base_url, auth_level).
 
     auth_level is "public" / "private" / "internal" / "" (override case).
@@ -114,13 +114,13 @@ def find_entrance(app: str, hint: Optional[str],
     )
 
 
-def get_entrance_auth_level(app: str, entrance: str) -> Optional[str]:
+def get_entrance_auth_level(app: str, entrance: str) -> str | None:
     """Re-read the live authLevel of one entrance via `apps get -o json`.
     Returns None if the entrance is gone (or apps get failed).
     """
     try:
         info = cli_json(["settings", "apps", "get", app])
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.debug("apps get %s failed: %s", app, exc)
         return None
     for r in (info or {}).get("entrances") or []:

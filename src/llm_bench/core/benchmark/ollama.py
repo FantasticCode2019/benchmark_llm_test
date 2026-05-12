@@ -8,18 +8,15 @@ import json
 import logging
 import time
 import urllib.request
-from typing import Optional, Tuple
 
-from models import QuestionResult
-from utils.format import human_bytes
-from utils.http import (
-    auth_hint,
-    http_post_json,
-    ollama_model_names,
-    ollama_tags,
-)
+from llm_bench.clients.ollama_client import ollama_model_names, ollama_tags
+from llm_bench.clients.openai_errors import auth_hint
+from llm_bench.constants import LOG_NAMESPACE
+from llm_bench.domain import QuestionResult
+from llm_bench.utils.format import human_bytes
+from llm_bench.utils.http import http_post_json
 
-log = logging.getLogger("llm_bench")
+log = logging.getLogger(LOG_NAMESPACE)
 
 
 def pull_model_ollama(url: str, model: str, *,
@@ -52,7 +49,7 @@ def pull_model_ollama(url: str, model: str, *,
     starts listing the target model. Raises if all attempts fail.
     """
     payload = json.dumps({"name": model, "stream": True}).encode("utf-8")
-    last_exc: Optional[BaseException] = None
+    last_exc: BaseException | None = None
     for attempt in range(1, max_attempts + 1):
         log.info("ollama pull %s (attempt %d/%d, stream=true, "
                  "per-attempt timeout=%ds)",
@@ -115,7 +112,7 @@ def pull_model_ollama(url: str, model: str, *,
                             model, attempt, max_attempts, last_exc)
         except RuntimeError:
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_exc = exc
             log.warning("ollama pull %s attempt %d/%d transport failed: %s",
                         model, attempt, max_attempts, exc)
@@ -137,8 +134,8 @@ def pull_model_ollama(url: str, model: str, *,
 
 def _measure_ollama_streaming_ttfts(url: str, model: str, prompt: str,
                                     *, request_timeout: int,
-                                    ) -> Tuple[Optional[float],
-                                               Optional[float]]:
+                                    ) -> tuple[float | None,
+                                               float | None]:
     """Open ONE streaming /api/generate call with `think:true` and read
     the first non-empty `thinking` and `response` chunks. Returns
     `(thinking_ttft, answer_ttft)`; either field is None when not
@@ -168,8 +165,8 @@ def _measure_ollama_streaming_ttfts(url: str, model: str, prompt: str,
         method="POST",
     )
 
-    thinking_ttft: Optional[float] = None
-    answer_ttft: Optional[float] = None
+    thinking_ttft: float | None = None
+    answer_ttft: float | None = None
     started = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=request_timeout) as resp:
@@ -198,7 +195,7 @@ def _measure_ollama_streaming_ttfts(url: str, model: str, prompt: str,
                     break
                 if chunk.get("done"):
                     break
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.warning("ollama streaming ttft probe failed: %s", exc)
         return None, None
 
@@ -225,7 +222,7 @@ def benchmark_prompt_ollama(url: str, model: str, prompt: str,
     try:
         body = http_post_json(f"{url}/api/generate", payload,
                               timeout=request_timeout)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         msg = str(exc)
         hint = auth_hint(exc)
         if hint:

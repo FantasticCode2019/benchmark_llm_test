@@ -9,12 +9,13 @@ import logging
 import os
 import re
 import subprocess
-from datetime import datetime
-from typing import List, Optional
 
-from utils.cli_runner import cli, run
+from llm_bench.constants import LOG_NAMESPACE
+from llm_bench.domain import InstallDecision
+from llm_bench.utils.cli_runner import cli, run
+from llm_bench.utils.time_utils import utc_now_naive
 
-log = logging.getLogger("llm_bench")
+log = logging.getLogger(LOG_NAMESPACE)
 
 
 # State buckets — keep in sync with cli/cmd/ctl/market/watch.go and
@@ -38,7 +39,7 @@ ROLLED_BACK_STATES = {
 
 
 def market_install(app: str, *, watch_minutes: int,
-                   envs: Optional[list] = None) -> None:
+                   envs: list | None = None) -> None:
     cmd = [cli(), "market", "install", app,
            "--watch", "--watch-timeout", f"{watch_minutes}m"]
     for kv in envs or []:
@@ -57,7 +58,7 @@ def market_uninstall(app: str, *, watch_minutes: int = 30,
     run(cmd, timeout=watch_minutes * 60 + 60)
 
 
-def get_app_state(app: str) -> Optional[dict]:
+def get_app_state(app: str) -> dict | None:
     """Returns the current statusRow dict, or None if the app isn't installed.
 
     Wraps `olares-cli market status <app> -a -o json`. The CLI exits non-zero
@@ -95,25 +96,28 @@ def market_status_watch(app: str, *, watch_minutes: int) -> None:
 
 
 def ensure_installed(app: str, *, install_minutes: int,
-                     uninstall_minutes: int, install_envs: list,
-                     delete_data: bool, skip_if_running: bool):
-    """Make sure the app is `running` before benchmarking.
+                     uninstall_minutes: int, install_envs: list[str],
+                     delete_data: bool, skip_if_running: bool,
+                     ) -> tuple[bool, InstallDecision]:
+    """Make sure the app is ``running`` before benchmarking.
 
-    Returns (already_existed, decision) where decision is one of
-    'reused' / 'fresh' / 'recovered'.
+    Returns ``(already_existed, decision)`` where ``decision`` is a
+    :class:`InstallDecision` enum member. The orchestrator stores it
+    directly on ``ModelResult.install_decision``; the JSON serializer
+    emits its string value so the wire format is unchanged.
     """
     row = get_app_state(app)
     if row is None:
         log.info("%s not installed, installing...", app)
         market_install(app, watch_minutes=install_minutes, envs=install_envs)
-        return (False, "fresh")
+        return (False, InstallDecision.FRESH)
 
     state = (row.get("state") or "").strip()
     log.info("%s pre-existing state=%r op=%r", app, state, row.get("opType"))
 
     if state in RUNNING_STATES and skip_if_running:
         log.info("%s already running -> skipping install", app)
-        return (True, "reused")
+        return (True, InstallDecision.REUSED)
 
     if state in PROGRESSING_STATES:
         log.info("%s mid-lifecycle (%s); waiting for terminal state...",
@@ -123,7 +127,7 @@ def ensure_installed(app: str, *, install_minutes: int,
         new_state = (row or {}).get("state", "")
         if new_state in RUNNING_STATES:
             log.info("%s converged to running after watch", app)
-            return (True, "reused")
+            return (True, InstallDecision.REUSED)
         log.warning("%s landed in %r after watch; reinstalling", app, new_state)
         state = new_state
 
@@ -132,16 +136,16 @@ def ensure_installed(app: str, *, install_minutes: int,
                  "(no uninstall needed: helm release already gone)",
                  app, state)
         market_install(app, watch_minutes=install_minutes, envs=install_envs)
-        return (False, "recovered")
+        return (False, InstallDecision.RECOVERED)
 
     log.warning("%s in non-running state (%s); uninstall + reinstall", app, state)
     try:
         market_uninstall(app, watch_minutes=uninstall_minutes,
                          delete_data=delete_data)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # pre-install uninstall is best-effort
         log.warning("pre-install uninstall failed (continuing): %s", exc)
     market_install(app, watch_minutes=install_minutes, envs=install_envs)
-    return (False, "recovered")
+    return (False, InstallDecision.RECOVERED)
 
 
 # Olares chart names are always lowercase alphanumeric (see
@@ -151,7 +155,7 @@ def ensure_installed(app: str, *, install_minutes: int,
 _SAFE_APP_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
-def _sudo_run(argv: List[str], sudo_password: str, *,
+def _sudo_run(argv: list[str], sudo_password: str, *,
               timeout: int = 30) -> subprocess.CompletedProcess:
     """`sudo -S -p '' <argv>` with the password fed via stdin.
 
@@ -168,7 +172,7 @@ def _sudo_run(argv: List[str], sudo_password: str, *,
     )
 
 
-def _list_pod_dirs(app: str, sudo_password: Optional[str]) -> List[str]:
+def _list_pod_dirs(app: str, sudo_password: str | None) -> list[str]:
     """Find `/var/log/pods/*<app>*` entries.
 
     Without sudo: `glob.glob` (works iff /var/log/pods/ is at least
@@ -202,7 +206,7 @@ def _list_pod_dirs(app: str, sudo_password: Optional[str]) -> List[str]:
 
 def archive_pod_logs(app: str, *, output_dir: str = "/tmp",
                      timeout: int = 120,
-                     sudo_password: Optional[str] = None) -> Optional[str]:
+                     sudo_password: str | None = None) -> str | None:
     """Tar+gzip every `/var/log/pods/*<app>*` directory into
     `<output_dir>/<app>_logs_<UTCstamp>.tar.gz` and return the archive
     path. Returns None when there's nothing to archive (no matching
@@ -236,7 +240,7 @@ def archive_pod_logs(app: str, *, output_dir: str = "/tmp",
                     app, output_dir, exc)
         return None
 
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    stamp = utc_now_naive().strftime("%Y%m%d_%H%M%S")
     archive = os.path.join(output_dir, f"{app}_logs_{stamp}.tar.gz")
     log.info("archiving %d pod log dir(s) for %s into %s%s",
              len(matches), app, archive,

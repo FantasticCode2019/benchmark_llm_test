@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import sys
 
-from utils.cli_runner import cli_json
+from llm_bench.utils.cli_runner import cli_json
 
 
-def probe_apps(apps: list) -> None:
+def probe_apps(apps: list[str]) -> None:
     for app in apps:
         try:
             info = cli_json(["market", "get", app])
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(f"{app}: probe failed -> {exc}", file=sys.stderr)
             continue
         envs = (info or {}).get("raw_data", {}).get("envs", [])

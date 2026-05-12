@@ -36,29 +36,25 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
 
-from utils.format import human_bytes
-from utils.http import (
-    bundle_cfg,
-    http_get_json,
-    http_get_status,
-    ollama_progress,
-    vllm_progress,
+from llm_bench.clients.ollama_client import ollama_progress
+from llm_bench.clients.vllm_client import bundle_cfg, vllm_progress
+from llm_bench.constants import (
+    LOG_NAMESPACE,
+    OLLAMA_PROBE_INTERVAL_SECONDS,
+    READINESS_FAILURE_RETRY_SECONDS,
 )
+from llm_bench.utils.format import human_bytes
+from llm_bench.utils.http import http_get_status
 
-log = logging.getLogger("llm_bench")
+log = logging.getLogger(LOG_NAMESPACE)
 
-# Fallback poll interval used for failure-mode retries: before vllm's
-# /cfg resolves (chart launcher still booting), and after /cfg when a
-# /progress probe comes back as transport error / non-2xx / unparseable.
-# vLLM happy-path /progress polling uses the server-supplied
-# probeIntervalMs; ollama uses _OLLAMA_PROBE_INTERVAL_SECONDS below.
-_FAILURE_RETRY_SECONDS = 5
-
-# ollama has no /cfg to read probeIntervalMs from — fixed cadence for
-# /progress and /health probing.
-_OLLAMA_PROBE_INTERVAL_SECONDS = 2
+# Private aliases kept so internal call-sites can stay terse (and so the
+# pre-refactor names are still searchable). Source of truth lives in
+# llm_bench.constants — see that module for rationale on each value.
+_FAILURE_RETRY_SECONDS = READINESS_FAILURE_RETRY_SECONDS
+_OLLAMA_PROBE_INTERVAL_SECONDS = OLLAMA_PROBE_INTERVAL_SECONDS
 
 
 # ----------------------------------------------------------------------
@@ -134,7 +130,7 @@ def _describe_vllm_status(status: str) -> str:
 # ----------------------------------------------------------------------
 
 def wait_until_api_ready(url: str, api_type: str, model: str,
-                         *, max_wait_minutes: int = 60) -> Optional[str]:
+                         *, max_wait_minutes: int = 60) -> str | None:
     """Block until the bundle finishes download AND the server loads it.
 
     Returns the server-reported model name when discoverable, else None.
@@ -158,7 +154,7 @@ def wait_until_api_ready(url: str, api_type: str, model: str,
 
 def _wait_until_ollama_ready(base: str, model: str, *,
                              deadline: float,
-                             max_wait_minutes: int) -> Optional[str]:
+                             max_wait_minutes: int) -> str | None:
     """Wait until ollama finishes pulling the model AND /health = ok.
 
     No /cfg step — ollama serves a single bundle at a time and exposes
@@ -182,7 +178,7 @@ def _wait_until_ollama_ready(base: str, model: str, *,
 
 def _wait_until_vllm_ready(base: str, model: str, *,
                            deadline: float,
-                           max_wait_minutes: int) -> Optional[str]:
+                           max_wait_minutes: int) -> str | None:
     log.info("vllm: resolving bundle config at %s/cfg (max wait %dm)",
              base, max_wait_minutes)
     cfg = _resolve_bundle_cfg(
@@ -334,14 +330,14 @@ def _find_vllm_task_for_model(cfg: dict, model: str) -> dict:
         f"task (repo/file/jobId). tasks={descr}")
 
 
-def _discover_vllm_served_name(base: str) -> Optional[str]:
+def _discover_vllm_served_name(base: str) -> str | None:
     """One-shot GET /v1/models -> data[0].id. Best-effort; None on error."""
     try:
         status, body = http_get_status(f"{base}/v1/models", timeout=10)
         if not (200 <= status < 300):
             return None
         items = json.loads(body or "{}").get("data") or []
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
     ids = [i for i in ((it or {}).get("id") for it in items) if i]
     return ids[0] if ids else None
@@ -636,7 +632,7 @@ def _poll_vllm_progress(base: str, job_id: str, *,
 # Ollama health poller (looks at the JSON body)
 # ----------------------------------------------------------------------
 
-def _poll_ollama_health(base: str, probe_url: Optional[str], *,
+def _poll_ollama_health(base: str, probe_url: str | None, *,
                         deadline: float, interval: float) -> None:
     """Poll ollama's /health until ANY HTTP 2xx response.
 
@@ -713,7 +709,7 @@ def _poll_vllm_ping(base: str, probe_url: str, *,
         time.sleep(interval)
 
 
-def _build_probe_url(base: str, probe_url: Optional[str],
+def _build_probe_url(base: str, probe_url: str | None,
                      default_path: str) -> str:
     p = (probe_url or "").strip() or default_path
     if p.startswith(("http://", "https://")):

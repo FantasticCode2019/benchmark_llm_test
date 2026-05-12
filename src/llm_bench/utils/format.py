@@ -1,10 +1,8 @@
 """Tiny formatting helpers — kept dependency-free for cross-cutting reuse."""
 from __future__ import annotations
 
-from typing import Optional
 
-
-def human_bytes(n: Optional[int]) -> str:
+def human_bytes(n: int | None) -> str:
     """`9876543` -> `9.4 MiB`."""
     if n is None:
         return "?"
@@ -21,7 +19,7 @@ def fmt_duration(seconds: float) -> str:
     """`123.4` -> `2m 03s`, `5.4` -> `5.4s`."""
     if seconds < 60:
         return f"{seconds:.1f}s"
-    m, s = divmod(int(round(seconds)), 60)
+    m, s = divmod(round(seconds), 60)
     if m < 60:
         return f"{m}m {s:02d}s"
     h, m = divmod(m, 60)

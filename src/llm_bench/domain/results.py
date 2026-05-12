@@ -1,24 +1,21 @@
-"""Dataclasses shared across the project. Stdlib-only on purpose."""
+"""Per-prompt and per-model result dataclasses.
+
+These are the **outputs** the benchmark produces. They get serialized to
+the JSON report via ``dataclasses.asdict`` and rendered into the HTML
+email table. The wire format (field names and value types) is part of
+the project's public contract — DO NOT rename or retype existing
+fields without coordinating with consumers.
+
+``api_type`` and ``install_decision`` are ``StrEnum`` values; because
+``StrEnum`` inherits from ``str``, ``json.dumps`` emits them as the same
+plain strings the pre-enum code used (``"ollama"``, ``"fresh"`` etc.),
+so the JSON output is byte-identical with v0.1.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
-
-@dataclass
-class OpenAIConfig:
-    """Per-model knobs for the openai-shape benchmark; all fields fall
-    back to the global `openai_defaults` block in the config.
-    """
-    api_key: str = "EMPTY"
-    endpoint: str = "chat"            # "chat" -> /v1/chat/completions
-                                      # "completion" -> /v1/completions
-    extra_headers: dict = field(default_factory=dict)
-    max_tokens: int = 256
-    temperature: float = 0.0
-    top_p: Optional[float] = None
-    extra_body: dict = field(default_factory=dict)
-    measure_ttft_approx: bool = True
+from llm_bench.domain.enums import ApiType, InstallDecision
 
 
 @dataclass
@@ -60,7 +57,7 @@ class QuestionResult:
     """
     prompt: str
     ok: bool = False
-    error: Optional[str] = None
+    error: str | None = None
     response_chars: int = 0
     wall_seconds: float = 0.0
     ttft_seconds: float = 0.0
@@ -83,34 +80,42 @@ class QuestionResult:
 
 @dataclass
 class ModelResult:
+    """Aggregated record for one model run. Holds the install / uninstall
+    timing plus the per-prompt list. Serialized to JSON via ``asdict``;
+    enum fields render as their string values (see module docstring).
+    """
     app_name: str
     model: str
-    api_type: str = "ollama"
+    api_type: ApiType = ApiType.OLLAMA
     started_at: str = ""
     finished_at: str = ""
-    install_decision: str = ""        # "fresh" / "reused" / "recovered" / ""
+    install_decision: InstallDecision = InstallDecision.UNKNOWN
     install_ok: bool = False
     install_seconds: float = 0.0
     uninstall_skipped: bool = False
     uninstall_ok: bool = False
     uninstall_seconds: float = 0.0
     endpoint: str = ""
-    error: Optional[str] = None
+    error: str | None = None
     # Set ONLY when the model run failed (install / readiness / uninstall
     # error or no prompt succeeded) and `save_pod_logs_on_failure=true`
     # successfully tar.gz'd the pod log directories. Path is local to
     # the host that ran the benchmark.
-    pod_logs_archive: Optional[str] = None
-    questions: list = field(default_factory=list)  # list[QuestionResult]
+    pod_logs_archive: str | None = None
+    questions: list[QuestionResult] = field(default_factory=list)
 
     def avg(self, attr: str) -> float:
-        ok = [getattr(q, attr) for q in self.questions if q.ok]
-        return (sum(ok) / len(ok)) if ok else 0.0
+        """Mean of ``attr`` across all successful prompts; 0.0 when
+        nothing succeeded. Used by the HTML renderer to fill the
+        summary columns.
+        """
+        ok_values = [getattr(q, attr) for q in self.questions if q.ok]
+        return (sum(ok_values) / len(ok_values)) if ok_values else 0.0
 
     def has_thinking_label(self) -> str:
-        """"Yes" / "No" for the email column, derived from the
-        per-prompt `has_thinking` flag (which is just the echo of
-        `spec.thinking` from the config). We pick the first ok row's
+        """``"Yes"`` / ``"No"`` for the email column, derived from the
+        per-prompt ``has_thinking`` flag (which is just the echo of
+        ``spec.thinking`` from the config). We pick the first ok row's
         flag — they all agree because the value comes straight from
         the same per-model config knob.
         """
@@ -118,3 +123,6 @@ class ModelResult:
             if q.ok:
                 return "Yes" if q.has_thinking else "No"
         return "No"
+
+
+__all__ = ["ModelResult", "QuestionResult"]

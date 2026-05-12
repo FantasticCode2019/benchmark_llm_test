@@ -6,11 +6,17 @@ import logging
 import subprocess
 from typing import Any
 
-log = logging.getLogger("llm_bench")
+from llm_bench.constants import (
+    CLI_JSON_DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_OLARES_CLI,
+    LOG_NAMESPACE,
+)
+
+log = logging.getLogger(LOG_NAMESPACE)
 
 # Set by set_cli_path() at startup; defaults to PATH-resolved `olares-cli`.
 # `--cli-path` / config `cli_path` override at boot time.
-_CLI_PATH = "olares-cli"
+_CLI_PATH = DEFAULT_OLARES_CLI
 
 
 def set_cli_path(path: str) -> None:
@@ -31,7 +37,7 @@ def run(cmd: list, *, timeout: int, capture: bool = False,
                           text=True, check=check)
 
 
-def cli_json(args: list, *, timeout: int = 60) -> Any:
+def cli_json(args: list, *, timeout: int = CLI_JSON_DEFAULT_TIMEOUT_SECONDS) -> Any:
     """Run `olares-cli ... -o json` and decode stdout."""
     proc = run([cli(), *args, "-o", "json"], timeout=timeout, capture=True)
     out = proc.stdout.strip()

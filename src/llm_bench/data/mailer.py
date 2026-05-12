@@ -5,23 +5,23 @@ import logging
 import smtplib
 import ssl
 import time
-from datetime import datetime
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Optional
 
-log = logging.getLogger("llm_bench")
+from llm_bench.constants import LOG_NAMESPACE
+from llm_bench.domain import AppConfig, EmailConfig
+from llm_bench.utils.time_utils import utc_now_naive
 
-_DEFAULT_SUBJECT = "Olares LLM benchmark {date}"
+log = logging.getLogger(LOG_NAMESPACE)
 
 
 def _render_subject(template: str, stamp: str) -> str:
-    """Substitute `{date}` / `{datetime}` / `{stamp}` placeholders in
-    the configured subject. Unknown braces are left untouched (so a
-    literal `{foo}` in the subject doesn't blow up).
+    """Substitute ``{date}`` / ``{datetime}`` / ``{stamp}`` placeholders
+    in the configured subject. Unknown braces are left untouched (so a
+    literal ``{foo}`` in the subject doesn't blow up).
     """
-    now = datetime.utcnow()
+    now = utc_now_naive()
     return (template
             .replace("{date}", now.strftime("%Y-%m-%d"))
             .replace("{datetime}", now.strftime("%Y-%m-%d %H:%M"))
@@ -30,7 +30,7 @@ def _render_subject(template: str, stamp: str) -> str:
 
 def _send_once(host: str, port: int, *, timeout: int, use_ssl: bool,
                username: str, password: str, sender: str,
-               rcpt: list, raw: str) -> None:
+               rcpt: list[str], raw: str) -> None:
     """One SMTP attempt — implicit TLS (465) vs STARTTLS (587)."""
     ctx = ssl.create_default_context()
     if use_ssl:
@@ -47,22 +47,33 @@ def _send_once(host: str, port: int, *, timeout: int, use_ssl: bool,
             s.sendmail(sender, rcpt, raw)
 
 
-def send_email(html: str, json_dump: str, cfg: dict, *, stamp: str) -> None:
+def _resolve_use_ssl(email: EmailConfig) -> bool:
+    """Pick the transport mode: explicit ``use_ssl`` wins, otherwise
+    fall back to the port-465-means-implicit-TLS heuristic. 465 hits
+    a TLS-only listener with plain SMTP would RST as
+    ``SMTPServerDisconnected``, so this default is important.
+    """
+    if email.use_ssl is not None:
+        return email.use_ssl
+    return email.smtp_port == 465
+
+
+def send_email(html: str, json_dump: str, cfg: AppConfig,
+               *, stamp: str) -> None:
     """Build the MIME message and ship it over SMTP, with retry on
     transport errors only.
 
     use_ssl heuristic: 465 → implicit TLS (SMTP_SSL); else STARTTLS.
     Hitting 465 with plain SMTP sends EHLO to a TLS-only listener and
-    the server RSTs, surfacing as `SMTPServerDisconnected`.
+    the server RSTs, surfacing as ``SMTPServerDisconnected``.
 
     Auth/protocol errors are raised on the first try (a retry can't help).
     """
-    smtp_cfg = cfg["email"]
+    email = cfg.email
     msg = MIMEMultipart("mixed")
-    msg["Subject"] = _render_subject(
-        smtp_cfg.get("subject") or _DEFAULT_SUBJECT, stamp)
-    msg["From"] = smtp_cfg["from"]
-    msg["To"] = smtp_cfg["to"]
+    msg["Subject"] = _render_subject(email.subject, stamp)
+    msg["From"] = email.sender
+    msg["To"] = email.to
 
     body = MIMEMultipart("alternative")
     body.attach(MIMEText(
@@ -76,33 +87,28 @@ def send_email(html: str, json_dump: str, cfg: dict, *, stamp: str) -> None:
                    filename=f"llm_bench_{stamp}.json")
     msg.attach(att)
 
-    host = smtp_cfg["smtp_host"]
-    port = int(smtp_cfg["smtp_port"])
-    timeout = int(smtp_cfg.get("smtp_timeout", 120))
-    retries = max(1, int(smtp_cfg.get("smtp_retries", 3)))
-    backoff = int(smtp_cfg.get("smtp_retry_backoff", 5))
-    use_ssl_cfg = smtp_cfg.get("use_ssl")
-    use_ssl = bool(use_ssl_cfg) if use_ssl_cfg is not None else (port == 465)
-
-    rcpt = [a.strip() for a in str(smtp_cfg["to"]).split(",") if a.strip()]
+    use_ssl = _resolve_use_ssl(email)
+    retries = max(1, email.smtp_retries)
+    rcpt = [a.strip() for a in email.to.split(",") if a.strip()]
     raw = msg.as_string()
 
     # NOTE on except order: smtplib.SMTPException inherits from OSError, so
     # SMTPAuthenticationError / SMTPException must be caught BEFORE the
     # broad transport tuple — otherwise auth failures would get swallowed
     # by the retry path and burn the whole retry budget.
-    last_exc: Optional[BaseException] = None
+    last_exc: BaseException | None = None
     for attempt in range(1, retries + 1):
         try:
             log.info(
                 "sending email via %s:%d (ssl=%s, timeout=%ds, "
                 "attempt %d/%d) to %s",
-                host, port, use_ssl, timeout, attempt, retries,
+                email.smtp_host, email.smtp_port, use_ssl,
+                email.smtp_timeout, attempt, retries,
                 ", ".join(rcpt))
-            _send_once(host, port, timeout=timeout, use_ssl=use_ssl,
-                       username=smtp_cfg["username"],
-                       password=smtp_cfg["password"],
-                       sender=smtp_cfg["from"], rcpt=rcpt, raw=raw)
+            _send_once(email.smtp_host, email.smtp_port,
+                       timeout=email.smtp_timeout, use_ssl=use_ssl,
+                       username=email.username, password=email.password,
+                       sender=email.sender, rcpt=rcpt, raw=raw)
             log.info("email sent")
             return
         except smtplib.SMTPAuthenticationError:
@@ -115,7 +121,7 @@ def send_email(html: str, json_dump: str, cfg: dict, *, stamp: str) -> None:
             log.warning("smtp attempt %d/%d failed: %s: %s",
                         attempt, retries, type(exc).__name__, exc)
             if attempt < retries:
-                time.sleep(min(backoff * attempt, 60))
+                time.sleep(min(email.smtp_retry_backoff * attempt, 60))
 
     assert last_exc is not None
     raise last_exc
