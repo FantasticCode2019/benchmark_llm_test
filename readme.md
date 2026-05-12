@@ -118,8 +118,8 @@ benchmark_llm_test/
 | 字段 | ollama | openai | 含义 |
 |---|---|---|---|
 | `wall_seconds` | ✓ | ✓ | 客户端端到端 round-trip |
-| `ttft_seconds` | server 精确 | max_tokens=1 近似 | 第一个 token 出现时间（带模型默认 thinking 的） |
-| `ttft_no_think_seconds` | server 精确 | max_tokens=1 近似 | **仅 `spec.thinking=true` 时填充**：关闭思考后的首 token 时间，用来对比 reasoning 模型的"用户感知首 token" |
+| `ttft_seconds` | server 精确 | `spec.thinking=true` 时取流式探针的 first-content delta；否则 max_tokens=1 近似 | "思考之后" 的首个回答 token 时间。带 thinking 的模型代表 reasoning trace 结束后开始吐 `content` 的时刻 |
+| `thinking_ttft_seconds` | `spec.thinking=true` 时由 `stream=true,think=true` 探针测；否则镜像 `ttft_seconds` | 同 ollama，但读 `delta.reasoning` / `delta.reasoning_content` | "思考中" 第一个 token 出现时间。普通模型自动等于 `ttft_seconds`，邮件表里同列就和 TTFT 一致 |
 | `eval_count` | server 报 | `usage.completion_tokens` 或字符估算 | 生成的 token 数 |
 | `eval_seconds` | server 报 | llama.cpp `timings.predicted_ms` 才有 | decode 用时 |
 | `tps` | server decode-only | server（llama.cpp）或 client（vLLM） | 主要 TPS 指标 |
@@ -173,9 +173,7 @@ benchmark_llm_test/
 | `save_pod_logs_on_failure` | `true` | 模型流程失败（install/readiness/benchmark/uninstall 任一阶段报错，或 chart 起来了但所有 prompt 都失败）时，把 `/var/log/pods/*<app_name>*` 这些目录 `tar -czf` 成 `<pod_logs_dir>/<app>_logs_<UTCstamp>.tar.gz`。**uninstall 之前**就归档（uninstall 会把 pod 一并清掉）。归档路径会写进 JSON 的 `pod_logs_archive` 字段，HTML 报表对应行的红色副标题里也会显示 |
 | `pod_logs_dir` | `/tmp` | 归档 tarball 的输出目录，自动创建 |
 | `sudo_password` | `""` | `/var/log/pods/` 在大多数 Olares 主机上是 root-only。脚本以非 root 跑时填这里：归档会自动改走 `sudo -S tar`（密码经 stdin 注入，**不**进 argv、**不**入日志），完事后 `sudo chown` 把 tarball 物归原主。**安全提示**：这是明文密码，建议把 config 文件 `chmod 600` 并加进 `.gitignore`；若以 root 直接跑或 `/var/log/pods` 已经放开了读权限，留空即可，归档走普通 `tar`。 |
-| `thinking` | `false` | 模型带「思考 / reasoning」阶段时设为 true：脚本会在每条 prompt 上再发一个 *关闭思考* 的 `max_tokens=1` 探针，把首 token 时间填进 `ttft_no_think_seconds`，方便和默认模式对比。普通模型保持 `false` 即可，那一列在 HTML 里会显示 `—` |
-| `thinking_disable_payload` | `{"think": false}` | **仅 ollama 用**：合并进 `/api/generate` 请求体来关思考。Ollama 0.10+ 支持 `think:false`，所以默认值通常够用 |
-| `thinking_disable_extra_body` | `{"chat_template_kwargs": {"enable_thinking": false}}` | **仅 openai 用**：合并进 `extra_body` 来关思考。默认值匹配 vLLM + Qwen3 / DeepSeek-R1 chat template；GPT-OSS 类用 `reasoning_effort` 时改成 `{"reasoning_effort": "none"}` |
+| `thinking` | `false` | 模型带「思考 / reasoning」阶段时设为 true：脚本会在每条 prompt 上额外发一个流式探针（ollama 走 `stream=true,think=true` /api/generate；openai 走 `stream=true` /v1/chat/completions），只读到第一个 reasoning delta + 第一个 content delta 就主动断开，分别填进 `thinking_ttft_seconds` 和 `ttft_seconds`。普通模型保持 `false` 即可，`thinking_ttft_seconds` 自动镜像 `ttft_seconds`（邮件里 Think TTFT 列等于 TTFT 列） |
 | `openai_defaults` | 见下表 | 全局 openai-shape 采样参数 |
 | `email` | **必填** | SMTP 配置，见下表 |
 

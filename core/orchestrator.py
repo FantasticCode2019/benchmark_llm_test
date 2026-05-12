@@ -56,14 +56,10 @@ def bench_model(spec: dict, prompts: list, cfg: dict) -> ModelResult:
     uninstall_after = bool(_opt(spec, cfg, "uninstall_after_run", True))
     install_envs = list(spec.get("envs") or [])
     openai_conf = openai_config_from(spec, cfg)
-    # Optional second TTFT measurement with thinking explicitly disabled
-    # (DeepSeek-R1 / Qwen3 / o1-style). Per-model only — most models
-    # don't have a thinking phase to disable.
+    # When true, run an additional streaming probe per prompt to capture
+    # `thinking_ttft_seconds` (first reasoning/thinking token time).
+    # Per-model only — most models don't have a thinking phase to measure.
     thinking = bool(_opt(spec, cfg, "thinking", False))
-    thinking_disable_payload = (
-        _opt(spec, cfg, "thinking_disable_payload", None) or None)
-    thinking_disable_extra_body = (
-        _opt(spec, cfg, "thinking_disable_extra_body", None) or None)
     # On failure (install/readiness/benchmark/uninstall), tar+gzip
     # /var/log/pods/*<app>* into pod_logs_dir so we can grep the chart's
     # init/launcher container output post-mortem. Disabled by setting
@@ -146,29 +142,33 @@ def bench_model(spec: dict, prompts: list, cfg: dict) -> ModelResult:
                     url, model, prompt, openai_conf,
                     request_timeout=request_timeout,
                     thinking=thinking,
-                    thinking_disable_extra_body=thinking_disable_extra_body,
                 )
             else:
                 qr = benchmark_prompt_ollama(
                     url, model, prompt,
                     request_timeout=request_timeout,
                     thinking=thinking,
-                    thinking_disable_payload=thinking_disable_payload,
                 )
             res.questions.append(qr)
             if qr.ok:
-                noth = (f" ttft_noT={qr.ttft_no_think_seconds:.3f}s"
-                        if qr.ttft_no_think_seconds else "")
+                # Surface the "first thinking token" timing whenever it
+                # differs from the answer-side TTFT (i.e. the model
+                # actually had a reasoning phase to measure).
+                think = ""
+                if (qr.thinking_ttft_seconds
+                        and qr.thinking_ttft_seconds != qr.ttft_seconds):
+                    think = f" think_ttft={qr.thinking_ttft_seconds:.3f}s"
                 if api_type == "openai":
-                    log.info("  -> wall=%.3fs ttft~%.3fs%s tokens=%d tps=%.2f "
-                             "(client_tps=%.2f, server_tps=%.2f)",
-                             qr.wall_seconds, qr.ttft_seconds, noth,
+                    log.info("  -> wall=%.3fs ttft~%.3fs%s tokens=%d "
+                             "tps=%.2f (client_tps=%.2f, server_tps=%.2f)",
+                             qr.wall_seconds, qr.ttft_seconds, think,
                              qr.eval_count, qr.tps, qr.client_tps,
                              qr.server_tps_reported)
                 else:
-                    log.info("  -> ttft=%.3fs%s tokens=%d tps=%.2f wall=%.3fs",
-                             qr.ttft_seconds, noth, qr.eval_count, qr.tps,
-                             qr.wall_seconds)
+                    log.info("  -> ttft=%.3fs%s tokens=%d tps=%.2f "
+                             "wall=%.3fs",
+                             qr.ttft_seconds, think, qr.eval_count,
+                             qr.tps, qr.wall_seconds)
             else:
                 log.warning("  -> error: %s", qr.error)
 

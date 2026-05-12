@@ -85,9 +85,13 @@ def render_html(results: list) -> str:
                 '</div>'
             )
 
-        ttft_nt_avg = r.avg("ttft_no_think_seconds")
-        ttft_nt_cell = (f"{ttft_nt_avg:.2f}" if ttft_nt_avg
-                        else '<span style="color:#bbb">—</span>')
+        # "Think TTFT" column: average of first-thinking-token times.
+        # For thinking-capable models the streaming probe fills it from
+        # the first reasoning/thinking delta; for non-thinking models the
+        # benchmark mirrors `ttft_seconds` so this column is always set.
+        ttft_think_avg = r.avg("thinking_ttft_seconds")
+        ttft_think_cell = (f"{ttft_think_avg:.2f}" if ttft_think_avg
+                           else '<span style="color:#bbb">—</span>')
 
         rows.append(
             f'<tr style="background:{bg};">'
@@ -105,8 +109,8 @@ def render_html(results: list) -> str:
             f'{html_escape(r.model)}</code></td>'
             f'<td style="{cell_c};color:#666">{html_escape(r.api_type)}</td>'
             f'<td style="{cell_c}">{ok_q}/{total_q}</td>'
+            f'<td style="{cell_r}">{ttft_think_cell}</td>'
             f'<td style="{cell_r}">{r.avg("ttft_seconds"):.2f}</td>'
-            f'<td style="{cell_r}">{ttft_nt_cell}</td>'
             f'<td style="{cell_r};font-weight:600;color:#0b5fff">'
             f'{r.avg("tps"):.1f}</td>'
             f'<td style="{cell_r}">{r.avg("eval_count"):.0f}</td>'
@@ -149,8 +153,8 @@ def render_html(results: list) -> str:
         f'<th style="{th_l}">Model</th>'
         f'<th style="{th_c}">API</th>'
         f'<th style="{th_c}">OK / N</th>'
+        f'<th style="{th_r}">Think TTFT (s)</th>'
         f'<th style="{th_r}">TTFT (s)</th>'
-        f'<th style="{th_r}">TTFT noT (s)</th>'
         f'<th style="{th_r}">TPS</th>'
         f'<th style="{th_r}">Tokens</th>'
         f'<th style="{th_r}">Wall (s)</th>'
@@ -161,11 +165,12 @@ def render_html(results: list) -> str:
         # footer legend — compact, single line wherever possible
         '<p style="margin:14px 2px 0;color:#888;font-size:11.5px;'
         'line-height:1.55">'
-        '<b>TTFT</b> = time to first token (with the model\'s natural '
-        'thinking behavior, if any) &middot; '
-        '<b>TTFT noT</b> = TTFT with thinking explicitly disabled '
-        '(only set when <code>spec.thinking=true</code>; '
-        '<span style="color:#bbb">—</span> means "not measured") &middot; '
+        '<b>Think TTFT</b> = time to the model\'s FIRST '
+        'reasoning/thinking token (Ollama <code>message.thinking</code>, '
+        'vLLM <code>delta.reasoning</code>); for non-thinking models '
+        'this mirrors <b>TTFT</b> &middot; '
+        '<b>TTFT</b> = time to the first ANSWER token (after thinking, '
+        'if any) &middot; '
         '<b>TPS</b> = generated tokens per second &middot; '
         '<b>Tokens</b> = avg generated tokens per prompt &middot; '
         '<b>Wall</b> = client-side request &rarr; response. '

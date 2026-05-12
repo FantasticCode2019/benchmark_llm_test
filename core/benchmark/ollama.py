@@ -1,4 +1,5 @@
-"""Ollama-specific helpers: /api/pull progress streaming + /api/generate
+"""
+Ollama-specific helpers: /api/pull progress streaming + /api/generate
 benchmark with precise server-side timing fields.
 """
 from __future__ import annotations
@@ -6,8 +7,9 @@ from __future__ import annotations
 import json
 import logging
 import time
+import urllib.error
 import urllib.request
-from typing import Optional
+from typing import Optional, Tuple
 
 from models import QuestionResult
 from utils.format import human_bytes
@@ -134,52 +136,88 @@ def pull_model_ollama(url: str, model: str, *,
     )
 
 
-def _ttft_no_think_probe(url: str, model: str, prompt: str,
-                         disable_payload: Optional[dict],
-                         *, request_timeout: int) -> Optional[float]:
-    """Send one short /api/generate call with thinking disabled and read
-    `load_duration + prompt_eval_duration` from the response.
+def _measure_ollama_streaming_ttfts(url: str, model: str, prompt: str,
+                                    *, request_timeout: int,
+                                    ) -> Tuple[Optional[float],
+                                               Optional[float]]:
+    """Open ONE streaming /api/generate call with `think:true` and read the
+    first non-empty `thinking` and `response` chunks. Returns
+    (thinking_ttft, answer_ttft); either may be None if the corresponding
+    field never appeared (e.g. the model has no thinking phase, or the
+    server merges thinking into `response`).
 
-    Caps generation to 1 token via `options.num_predict=1` so the probe
-    isn't a full inference (we only need the prefill timing).
+    Per cankao.md: ollama 0.10+ exposes thinking via the `thinking` field
+    on each NDJSON chunk; the actual answer arrives in `response`. We
+    close the connection as soon as both are seen so the server stops
+    decoding early and the probe doesn't pay for a full generation.
     """
-    payload: dict = {
+    payload = {
         "model": model,
         "prompt": prompt,
-        "stream": False,
-        "think": False,
-        "options": {"num_predict": 1},
+        "think": True,
+        "stream": True,
     }
-    if disable_payload:
-        for k, v in disable_payload.items():
-            if k == "options" and isinstance(v, dict) \
-                    and isinstance(payload.get("options"), dict):
-                payload["options"].update(v)
-            else:
-                payload[k] = v
+    req = urllib.request.Request(
+        f"{url.rstrip('/')}/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/x-ndjson"},
+        method="POST",
+    )
+
+    thinking_ttft: Optional[float] = None
+    answer_ttft: Optional[float] = None
+    started = time.perf_counter()
     try:
-        body = http_post_json(f"{url}/api/generate", payload,
-                              timeout=request_timeout)
+        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
+            for raw_line in resp:
+                if not raw_line:
+                    continue
+                try:
+                    chunk = json.loads(
+                        raw_line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                # /api/generate returns thinking at the top level;
+                # /api/chat would nest it under message.thinking instead.
+                thinking = chunk.get("thinking")
+                response = chunk.get("response")
+
+                if thinking and thinking_ttft is None:
+                    thinking_ttft = time.perf_counter() - started
+                if response and answer_ttft is None:
+                    answer_ttft = time.perf_counter() - started
+
+                if (thinking_ttft is not None
+                        and answer_ttft is not None):
+                    break
+                if chunk.get("done"):
+                    break
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+        log.warning("ollama streaming ttft probe failed: %s", exc)
     except Exception as exc:  # noqa: BLE001
-        log.warning("ttft_no_think probe failed: %s", exc)
-        return None
-    load = body.get("load_duration", 0) / 1e9
-    prompt_eval = body.get("prompt_eval_duration", 0) / 1e9
-    return load + prompt_eval
+        log.warning("ollama streaming ttft probe raised: %s", exc)
+
+    return thinking_ttft, answer_ttft
 
 
 def benchmark_prompt_ollama(url: str, model: str, prompt: str,
                             *,
                             request_timeout: int,
                             thinking: bool = False,
-                            thinking_disable_payload: Optional[dict] = None,
                             ) -> QuestionResult:
     """One non-streaming /api/generate call. Decode server-reported
     durations (nanoseconds) into the unified QuestionResult shape.
 
-    When `thinking=True`, send an additional short probe with thinking
-    explicitly disabled (default `{"think": false}`) so we can compare
-    the ttft you'd actually see if reasoning were turned off.
+    When `thinking=True`, send an additional streaming probe with
+    `think:true` and capture the first reasoning token time
+    (`thinking_ttft_seconds`). The connection is closed as soon as both
+    first thinking and first response chunks are observed.
+
+    For non-thinking models `thinking_ttft_seconds` mirrors `ttft_seconds`
+    (per request: "若模型不带thinking能力，那么设置这一列和现有的TTFT值相同即可").
     """
     payload = {"model": model, "prompt": prompt, "stream": False}
     started = time.perf_counter()
@@ -204,21 +242,24 @@ def benchmark_prompt_ollama(url: str, model: str, prompt: str,
     eval_dur = body.get("eval_duration", 0) / 1e9
     total = body.get("total_duration", 0) / 1e9
 
-    ttft_no_think = 0.0
+    ttft_seconds = round(load + prompt_eval, 3)
+    thinking_ttft_seconds = ttft_seconds
+
     if thinking:
-        probed = _ttft_no_think_probe(url, model, prompt,
-                                      thinking_disable_payload,
-                                      request_timeout=request_timeout)
-        if probed is not None:
-            ttft_no_think = round(probed, 3)
+        # Streaming probe with think=true captures the FIRST reasoning
+        # token (= "思考中第一个 token 出来的时间").
+        think_ttft, _ = _measure_ollama_streaming_ttfts(
+            url, model, prompt, request_timeout=request_timeout)
+        if think_ttft is not None:
+            thinking_ttft_seconds = round(think_ttft, 3)
 
     return QuestionResult(
         prompt=prompt,
         ok=True,
         response_chars=len(body.get("response", "")),
         wall_seconds=round(wall, 3),
-        ttft_seconds=round(load + prompt_eval, 3),
-        ttft_no_think_seconds=ttft_no_think,
+        ttft_seconds=ttft_seconds,
+        thinking_ttft_seconds=thinking_ttft_seconds,
         load_seconds=round(load, 3),
         prompt_eval_seconds=round(prompt_eval, 3),
         eval_count=eval_count,
