@@ -27,9 +27,16 @@ their wire protocols differ:
 
 Both pollers tolerate transport / 5xx / unparseable bodies and retry
 every `_FAILURE_RETRY_SECONDS` (5s). vLLM's happy-path poll interval is
-the server-supplied `probeIntervalMs`; ollama uses
-`_OLLAMA_PROBE_INTERVAL_SECONDS` (no /cfg to ask). The outer deadline is
-`api_ready_timeout_minutes`.
+the server-supplied `probeIntervalMs` (falling back to the configured
+`readiness_probe_interval_seconds` when the server omits it); ollama
+uses `readiness_probe_interval_seconds` directly because it has no /cfg
+to read.
+
+There is **no outer deadline** — pollers run indefinitely until they
+hit a terminal `success` / `error` / `unavailable` status from the
+server. The legacy ``api_ready_timeout_minutes`` config field has been
+removed; if you need to cap wall-clock time, wrap the run in your own
+scheduler (cron / systemd timer with a `RuntimeMaxSec=`).
 """
 from __future__ import annotations
 
@@ -40,21 +47,16 @@ from collections.abc import Callable
 
 from llm_bench.clients.ollama_client import ollama_progress
 from llm_bench.clients.vllm_client import bundle_cfg, vllm_progress
-from llm_bench.constants import (
-    LOG_NAMESPACE,
-    OLLAMA_PROBE_INTERVAL_SECONDS,
-    READINESS_FAILURE_RETRY_SECONDS,
-)
+from llm_bench.constants import LOG_NAMESPACE, READINESS_FAILURE_RETRY_SECONDS
 from llm_bench.utils.format import human_bytes
 from llm_bench.utils.http import http_get_status
 
 log = logging.getLogger(LOG_NAMESPACE)
 
-# Private aliases kept so internal call-sites can stay terse (and so the
-# pre-refactor names are still searchable). Source of truth lives in
-# llm_bench.constants — see that module for rationale on each value.
+# Private alias kept so internal call-sites can stay terse (and so the
+# pre-refactor name is still searchable). Source of truth lives in
+# llm_bench.constants — see that module for rationale on the value.
 _FAILURE_RETRY_SECONDS = READINESS_FAILURE_RETRY_SECONDS
-_OLLAMA_PROBE_INTERVAL_SECONDS = OLLAMA_PROBE_INTERVAL_SECONDS
 
 
 # ----------------------------------------------------------------------
@@ -130,22 +132,24 @@ def _describe_vllm_status(status: str) -> str:
 # ----------------------------------------------------------------------
 
 def wait_until_api_ready(url: str, api_type: str, model: str,
-                         *, max_wait_minutes: int = 60) -> str | None:
+                         *, probe_interval_seconds: float) -> str | None:
     """Block until the bundle finishes download AND the server loads it.
 
+    No outer deadline — pollers run until the server reports a terminal
+    status. ``probe_interval_seconds`` is the happy-path cadence used by
+    ollama directly; vllm prefers the server-supplied
+    ``cfg.probeIntervalMs`` and falls back to this value when missing.
+
     Returns the server-reported model name when discoverable, else None.
-    Source: ollama -> /cfg.modelName; vllm -> /v1/models data[0].id
-    queried after /ping is ok.
+    Source: ollama -> None (no /cfg to read); vllm -> /v1/models
+    data[0].id queried after /ping is ok.
     """
     base = url.rstrip("/")
-    deadline = time.monotonic() + max_wait_minutes * 60
     if api_type == "ollama":
         return _wait_until_ollama_ready(
-            base, model, deadline=deadline,
-            max_wait_minutes=max_wait_minutes)
+            base, model, interval=float(probe_interval_seconds))
     return _wait_until_vllm_ready(
-        base, model, deadline=deadline,
-        max_wait_minutes=max_wait_minutes)
+        base, model, fallback_interval=float(probe_interval_seconds))
 
 
 # ----------------------------------------------------------------------
@@ -153,8 +157,7 @@ def wait_until_api_ready(url: str, api_type: str, model: str,
 # ----------------------------------------------------------------------
 
 def _wait_until_ollama_ready(base: str, model: str, *,
-                             deadline: float,
-                             max_wait_minutes: int) -> str | None:
+                             interval: float) -> str | None:
     """Wait until ollama finishes pulling the model AND /health = ok.
 
     No /cfg step — ollama serves a single bundle at a time and exposes
@@ -162,13 +165,11 @@ def _wait_until_ollama_ready(base: str, model: str, *,
     Returns None: the configured `model_name` is used as-is (no
     server-reported name to discover).
     """
-    interval = float(_OLLAMA_PROBE_INTERVAL_SECONDS)
     log.info("ollama: poll %s/api/progress (every %.1fs) then %s/health "
-             "(every %.1fs); max wait %dm",
-             base, interval, base, interval, max_wait_minutes)
-    _poll_ollama_progress(base, deadline=deadline, interval=interval)
-    _poll_ollama_health(base, None,
-                        deadline=deadline, interval=interval)
+             "(every %.1fs); no outer deadline",
+             base, interval, base, interval)
+    _poll_ollama_progress(base, interval=interval)
+    _poll_ollama_health(base, None, interval=interval)
     return None
 
 
@@ -177,12 +178,11 @@ def _wait_until_ollama_ready(base: str, model: str, *,
 # ----------------------------------------------------------------------
 
 def _wait_until_vllm_ready(base: str, model: str, *,
-                           deadline: float,
-                           max_wait_minutes: int) -> str | None:
-    log.info("vllm: resolving bundle config at %s/cfg (max wait %dm)",
-             base, max_wait_minutes)
+                           fallback_interval: float) -> str | None:
+    log.info("vllm: resolving bundle config at %s/cfg "
+             "(no outer deadline)", base)
     cfg = _resolve_bundle_cfg(
-        base, deadline=deadline,
+        base,
         validator=_vllm_cfg_valid,
         label="vllm bundle",
     )
@@ -196,16 +196,15 @@ def _wait_until_vllm_ready(base: str, model: str, *,
     ref = task.get("ref") or "?"
     file_name = task.get("file") or "?"
     probe_url = cfg.get("probeUrl") or "/ping"
-    interval = _cfg_interval_seconds(cfg.get("probeIntervalMs"))
+    interval = _cfg_interval_seconds(cfg.get("probeIntervalMs"),
+                                     fallback=fallback_interval)
 
     log.info("vllm bundle: job=%s repo=%s ref=%s file=%s probe=%s "
              "interval=%.1fs",
              job_id, repo, ref, file_name, probe_url, interval)
 
-    _poll_vllm_progress(base, job_id,
-                        deadline=deadline, interval=interval)
-    _poll_vllm_ping(base, probe_url,
-                    deadline=deadline, interval=interval)
+    _poll_vllm_progress(base, job_id, interval=interval)
+    _poll_vllm_ping(base, probe_url, interval=interval)
     discovered = _discover_vllm_served_name(base)
     if discovered:
         log.info("vllm bundle: discovered served name=%r via /v1/models",
@@ -347,9 +346,14 @@ def _discover_vllm_served_name(base: str) -> str | None:
 # Shared core: cfg / progress / probe pollers
 # ----------------------------------------------------------------------
 
-def _cfg_interval_seconds(probe_interval_ms) -> float:
+def _cfg_interval_seconds(probe_interval_ms,
+                          *, fallback: float) -> float:
     """Convert /cfg's `probeIntervalMs` to seconds; clamp to >=1s, fall
-    back to `_FAILURE_RETRY_SECONDS` when missing / unparseable / zero.
+    back to ``fallback`` (the configured
+    ``readiness_probe_interval_seconds``) when missing / unparseable /
+    zero. The previous default was the hard-coded
+    ``_FAILURE_RETRY_SECONDS``; surfacing it via config lets users
+    speed up / slow down the steady-state cadence without recompiling.
     """
     try:
         ms = int(probe_interval_ms)
@@ -357,7 +361,7 @@ def _cfg_interval_seconds(probe_interval_ms) -> float:
         ms = 0
     if ms > 0:
         return max(1.0, ms / 1000.0)
-    return float(_FAILURE_RETRY_SECONDS)
+    return float(fallback)
 
 
 def _truncate(text: str, limit: int = 500) -> str:
@@ -371,15 +375,14 @@ def _truncate(text: str, limit: int = 500) -> str:
 
 
 def _resolve_bundle_cfg(base: str, *,
-                        deadline: float,
                         validator: Callable[[dict], bool],
                         label: str) -> dict:
     """GET <base>/cfg until validator(data)==True. Retries every
     `_FAILURE_RETRY_SECONDS` on transport failure / non-2xx / invalid
-    body so the chart launcher gets time to come up. Raises on deadline.
+    body so the chart launcher gets time to come up. No outer deadline;
+    runs until the chart launcher serves a usable /cfg.
     """
     attempt = 0
-    last_msg = ""
     while True:
         attempt += 1
         data, status, raw = bundle_cfg(base)
@@ -395,10 +398,6 @@ def _resolve_bundle_cfg(base: str, *,
             last_msg = (f"/cfg HTTP {status} or non-JSON body "
                         f"(chart launcher still spinning up?): "
                         f"{_truncate(raw)}")
-        if time.monotonic() > deadline:
-            raise RuntimeError(
-                f"{label}: timed out waiting for {base}/cfg "
-                f"to become usable — last: {last_msg}")
         log.info("%s: %s; sleeping %ds before retry",
                  label, last_msg, _FAILURE_RETRY_SECONDS)
         time.sleep(_FAILURE_RETRY_SECONDS)
@@ -478,10 +477,10 @@ def _log_progress_parse_failure(label: str, endpoint: str,
 # Ollama progress poller (plain-JSON snapshot, ollama-only states)
 # ----------------------------------------------------------------------
 
-def _poll_ollama_progress(base: str, *,
-                          deadline: float, interval: float) -> None:
+def _poll_ollama_progress(base: str, *, interval: float) -> None:
     """Poll ollama's plain-JSON /progress (no query string) until
-    terminal status.
+    terminal status. No outer deadline — runs until the server reports
+    a terminal status.
 
     Terminal states (per the ollama bundle spec):
       success: completed | success
@@ -494,21 +493,15 @@ def _poll_ollama_progress(base: str, *,
     `_FAILURE_RETRY_SECONDS`.
     """
     log.info("ollama: polling %s/api/progress every %.1fs "
-             "(fallback %ds on transport / non-JSON)",
+             "(fallback %ds on transport / non-JSON; no outer deadline)",
              base, interval, _FAILURE_RETRY_SECONDS)
     attempt = 0
-    last_msg = ""
     while True:
         attempt += 1
         body, http_status, raw = ollama_progress(base)
         if body is None:
             _log_progress_parse_failure("ollama progress", "/api/progress",
                                         http_status, raw, attempt)
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    f"ollama: download did not complete before deadline; "
-                    f"last: HTTP {http_status} unparseable body "
-                    f"{_truncate(raw)}")
             time.sleep(_FAILURE_RETRY_SECONDS)
             continue
 
@@ -534,7 +527,6 @@ def _poll_ollama_progress(base: str, *,
                 f"(ollama unreachable, or model deleted post-success; "
                 f"message={err or '(no error_message)'}); body={body_json}")
 
-        # In-flight: log and continue.
         last_msg = _format_ollama_in_flight(body, status_text, err)
         description = _describe_ollama_status(status_text)
         if description:
@@ -543,11 +535,6 @@ def _poll_ollama_progress(base: str, *,
         else:
             log.info("ollama progress: %s  body=%s",
                      last_msg, body_json)
-
-        if time.monotonic() > deadline:
-            raise RuntimeError(
-                f"ollama: download did not complete before deadline; "
-                f"last status: {last_msg or '(none)'}; body={body_json}")
         time.sleep(interval)
 
 
@@ -556,8 +543,9 @@ def _poll_ollama_progress(base: str, *,
 # ----------------------------------------------------------------------
 
 def _poll_vllm_progress(base: str, job_id: str, *,
-                        deadline: float, interval: float) -> None:
-    """Poll vllm's SSE /progress until terminal status.
+                        interval: float) -> None:
+    """Poll vllm's SSE /progress until terminal status. No outer
+    deadline — runs until the server reports a terminal status.
 
     Wire format: each request returns one or more SSE events of the form
     `data: {"id":"...","status":"<state>",...}`. `vllm_progress()` picks
@@ -572,10 +560,10 @@ def _poll_vllm_progress(base: str, job_id: str, *,
     every `_FAILURE_RETRY_SECONDS`.
     """
     log.info("vllm bundle: polling %s/progress?id=%s every %.1fs "
-             "(SSE; fallback %ds on transport / non-parseable)",
+             "(SSE; fallback %ds on transport / non-parseable; "
+             "no outer deadline)",
              base, job_id, interval, _FAILURE_RETRY_SECONDS)
     attempt = 0
-    last_msg = ""
     while True:
         attempt += 1
         body, http_status, raw = vllm_progress(base, job_id)
@@ -583,11 +571,6 @@ def _poll_vllm_progress(base: str, job_id: str, *,
             _log_progress_parse_failure("vllm bundle progress",
                                         f"/progress?id={job_id}",
                                         http_status, raw, attempt)
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    f"vllm bundle {job_id!r}: download did not complete "
-                    f"before deadline; last: HTTP {http_status} "
-                    f"unparseable body {_truncate(raw)}")
             time.sleep(_FAILURE_RETRY_SECONDS)
             continue
 
@@ -610,7 +593,6 @@ def _poll_vllm_progress(base: str, job_id: str, *,
                 f"vllm bundle {job_id!r} reported status=error "
                 f"(message={err or '(no error_message)'}); body={body_json}")
 
-        # queued / running / unknown: log and continue.
         last_msg = _format_vllm_in_flight(body, status_text, err)
         description = _describe_vllm_status(status_text)
         if description:
@@ -619,12 +601,6 @@ def _poll_vllm_progress(base: str, job_id: str, *,
         else:
             log.info("vllm bundle progress: %s  body=%s",
                      last_msg, body_json)
-
-        if time.monotonic() > deadline:
-            raise RuntimeError(
-                f"vllm bundle {job_id!r}: download did not complete "
-                f"before deadline; last status: {last_msg or '(none)'}; "
-                f"body={body_json}")
         time.sleep(interval)
 
 
@@ -633,8 +609,9 @@ def _poll_vllm_progress(base: str, job_id: str, *,
 # ----------------------------------------------------------------------
 
 def _poll_ollama_health(base: str, probe_url: str | None, *,
-                        deadline: float, interval: float) -> None:
-    """Poll ollama's /health until ANY HTTP 2xx response.
+                        interval: float) -> None:
+    """Poll ollama's /health until ANY HTTP 2xx response. No outer
+    deadline — runs until /health answers 2xx.
 
     The chart's /health endpoint starts answering 2xx after the model
     is loaded into ollama; the body is NOT inspected (response can be
@@ -646,7 +623,7 @@ def _poll_ollama_health(base: str, probe_url: str | None, *,
     """
     full_url = _build_probe_url(base, probe_url, "/health")
     log.info("ollama: waiting for model load at %s every %.1fs "
-             "(HTTP 2xx = ready)", full_url, interval)
+             "(HTTP 2xx = ready; no outer deadline)", full_url, interval)
     attempt = 0
     while True:
         attempt += 1
@@ -662,10 +639,6 @@ def _poll_ollama_health(base: str, probe_url: str | None, *,
         else:
             log.info("ollama health: HTTP %s still loading: %s",
                      http_status, _truncate(raw, 200))
-        if time.monotonic() > deadline:
-            raise RuntimeError(
-                f"ollama health probe at {full_url} did not reach "
-                f"HTTP 2xx before deadline")
         time.sleep(interval)
 
 
@@ -674,20 +647,21 @@ def _poll_ollama_health(base: str, probe_url: str | None, *,
 # ----------------------------------------------------------------------
 
 def _poll_vllm_ping(base: str, probe_url: str, *,
-                    deadline: float, interval: float) -> None:
-    """Poll vllm's /ping until ANY HTTP 2xx response.
+                    interval: float) -> None:
+    """Poll vllm's /ping until ANY HTTP 2xx response. No outer deadline
+    — runs until /ping answers 2xx.
 
     The vllm-side chart's /ping starts answering 2xx after the backend
     has finished bringing the model online; the body is NOT inspected
     (it may be `pong`, `{}`, `{"status":"ok"}`, or absent). Anything
     else — transport error, 404 (route not wired yet), 503 (still
-    loading) — is logged and retried until the outer deadline.
+    loading) — is logged and retried indefinitely.
     `probe_url` may be relative ('/ping') or absolute; empty falls back
     to '/ping' on `base`.
     """
     full_url = _build_probe_url(base, probe_url, "/ping")
     log.info("vllm bundle: waiting for model load at %s every %.1fs "
-             "(HTTP 2xx = ready)", full_url, interval)
+             "(HTTP 2xx = ready; no outer deadline)", full_url, interval)
     attempt = 0
     while True:
         attempt += 1
@@ -702,10 +676,6 @@ def _poll_vllm_ping(base: str, probe_url: str, *,
         else:
             log.info("vllm bundle health: HTTP %s still loading: %s",
                      http_status, _truncate(raw, 200))
-        if time.monotonic() > deadline:
-            raise RuntimeError(
-                f"vllm bundle health probe at {full_url} did not reach "
-                f"HTTP 2xx before deadline")
         time.sleep(interval)
 
 

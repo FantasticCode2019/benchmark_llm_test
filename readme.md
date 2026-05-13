@@ -65,7 +65,7 @@ pip install -e ".[dev]"         # 可选：装 pytest / ruff / mypy
 4. `GET <entrance><probeUrl, 默认 /ping>` 按 `probeIntervalMs` 轮询 —— **任何 HTTP 2xx 即放行**，不解析 body（`pong` / `{}` / `{"status":"ok"}` 都接受）。`probeUrl` 既可以是相对路径，也可以是绝对 URL（自动识别）。
 5. 加载完成后一次性 `GET <entrance>/v1/models`，把 `data[0].id` 作为 served name 回填到报告（vLLM 实际 serve 的名字可能跟 HF repo 不一致）。
 
-> 截止时间统一受 `api_ready_timeout_minutes` 控制（默认 60 分钟）。失败重试（transport / 非 2xx / 非 JSON / 非 SSE）固定 5 秒退避，跟成功路径的轮询间隔分开。
+> **没有外层截止时间**：轮询会一直跑到服务器报告终态（`completed/success/done` → 放行；`error/unavailable` → 抛错）。需要硬性限时请在调度层处理（cron 用 `timeout`、systemd 用 `RuntimeMaxSec=`）。成功路径轮询间隔由 `readiness_probe_interval_seconds`（默认 2s）控制；失败重试（transport / 非 2xx / 非 JSON / 非 SSE）固定 5 秒退避。vLLM 优先用服务端 `/cfg.probeIntervalMs`，缺省时回退到 `readiness_probe_interval_seconds`。
 
 ---
 
@@ -199,7 +199,7 @@ benchmark_llm_test/
 | `install_timeout_minutes` | 90 | `market install --watch` 超时（分钟） |
 | `uninstall_timeout_minutes` | 30 | `market uninstall --watch` 超时（分钟） |
 | `request_timeout_seconds` | 1800 | 单次推理 HTTP 请求超时（秒） |
-| `api_ready_timeout_minutes` | 60 | 就绪门最长等多少分钟。覆盖下载 + 模型加载两段。ollama 用固定 2s 轮询 `/api/progress` 和 `/health`；vllm 用服务端 `probeIntervalMs`；任何 backend 的失败重试都是固定 5s |
+| `readiness_probe_interval_seconds` | 2 | 就绪门 happy-path 轮询间隔（秒）。ollama `/api/progress` 和 `/health` 都用这个间隔；vllm 优先用服务端 `cfg.probeIntervalMs`，缺省时回退到这里。**就绪门没有外层截止时间**——下载 + 模型加载会一直轮询到服务器报告终态（`completed`/`error` 等），如需硬性限时请在 cron / systemd 层用 `timeout` / `RuntimeMaxSec=`。失败重试（transport / 非 2xx / 非 JSON）固定 5s |
 | `delete_data` | `true` | uninstall 时是否带 `--delete-data` 释放磁盘 |
 | `auto_open_internal_entrance` | `true` | entrance 不是 public 时自动调 `auth-level set --level public` + `policy set --default-policy public`。设置 per-app，模型 uninstall 时跟着销毁，所以不会泄漏 |
 | `skip_install_if_running` | `true` | 已 running 的 chart 跳过 install |

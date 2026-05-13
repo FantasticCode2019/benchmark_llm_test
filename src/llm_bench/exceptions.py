@@ -18,10 +18,17 @@ Hierarchy::
     │   └── EntranceFlipTimeout
     ├── ReadinessError                    (bundle / probe failures)
     │   ├── BundleConfigError             (/cfg unusable)
-    │   ├── BundleProgressError           (/progress reported `error`)
-    │   └── ReadinessTimeout              (outer deadline hit)
-    ├── ModelPullError                    (ollama /api/pull gave up)
+    │   └── BundleProgressError           (/progress reported `error`)
     └── BenchmarkRunError                 (per-prompt benchmark POST failed)
+
+Note: there is no longer a ``ModelPullError`` — the script no longer
+issues its own ``ollama /api/pull``. Every supported olares-market
+``ollama*`` chart pulls in its launcher container, and readiness is
+established by polling ``/api/tags``.
+
+Note: there is no longer a ``ReadinessTimeout`` — the readiness pollers
+run indefinitely (no outer deadline). Cap wall-clock time at the
+scheduler level if needed.
 
 OpenAI-compatible HTTP failures keep their own ``OpenAIHTTPError`` (in
 ``llm_bench.clients.openai_errors``) because callers introspect its
@@ -110,17 +117,9 @@ class BundleProgressError(ReadinessError):
     """`/progress` reported the terminal `error` / `unavailable` status."""
 
 
-class ReadinessTimeout(ReadinessError):
-    """`api_ready_timeout_minutes` elapsed before the bundle finished."""
-
-
 # ---------------------------------------------------------------------------
 # Per-model operations
 # ---------------------------------------------------------------------------
-
-
-class ModelPullError(BenchmarkError):
-    """`ollama /api/pull` failed all retries."""
 
 
 class BenchmarkRunError(BenchmarkError):
@@ -139,7 +138,5 @@ __all__ = [
     "ConfigValidationError",
     "EntranceError",
     "EntranceFlipTimeout",
-    "ModelPullError",
     "ReadinessError",
-    "ReadinessTimeout",
 ]

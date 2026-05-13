@@ -1,6 +1,15 @@
 """
-Ollama-specific helpers: /api/pull progress streaming + /api/generate
-benchmark with precise server-side timing fields.
+Ollama-specific helpers: /api/generate benchmark with precise
+server-side timing fields, plus a one-shot streaming probe used to
+fill ``thinking_ttft_seconds`` when the model exposes a reasoning
+phase.
+
+Note on /api/pull: every supported olares-market ``ollama*`` chart
+ships a launcher container that runs ``ollama pull <model>`` at
+startup, so this module no longer issues its own pull. Readiness is
+established by ``wait_until_api_ready`` watching ``/api/tags`` —
+identical to the launcher's own "Waiting for Ollama" → "Ready to
+chat" gate.
 """
 from __future__ import annotations
 
@@ -9,127 +18,12 @@ import logging
 import time
 import urllib.request
 
-from llm_bench.clients.ollama_client import ollama_model_names, ollama_tags
 from llm_bench.clients.openai_errors import auth_hint
 from llm_bench.constants import LOG_NAMESPACE
 from llm_bench.domain import QuestionResult
-from llm_bench.utils.format import human_bytes
 from llm_bench.utils.http import http_post_json
 
 log = logging.getLogger(LOG_NAMESPACE)
-
-
-def pull_model_ollama(url: str, model: str, *,
-                      timeout: int,
-                      max_attempts: int = 5,
-                      retry_sleep_seconds: int = 30,
-                      log_every_seconds: int = 30) -> None:
-    """Trigger an Ollama model pull. Streams progress; idempotent + resumable.
-
-    OPT-IN escape hatch — disabled by default in `bench_model`. The Ollama
-    charts in olares-market all ship a launcher container that runs
-    `ollama pull <model>` at startup, so the canonical flow is:
-
-        chart launcher pulls -> wait_until_api_ready watches /api/tags
-
-    Set `pull_model: true` per-model only when the chart does NOT auto-pull
-    or when you want streaming progress in the SCRIPT's stdout.
-
-    Implementation notes:
-      1. `stream:true` so Ollama emits an event every few seconds; the
-         connection stays warm AND we get a real progress log instead of
-         a silent block past most ingresses' 60s idle timeout.
-      2. Transport failures retry up to `max_attempts` times. Ollama's
-         pull is idempotent + resumable, so a reconnect resumes from
-         where the last attempt died. Between attempts we cheaply
-         re-check /api/tags; if the model is already present (e.g. the
-         chart's launcher beat us to it), we exit cleanly.
-
-    Returns when Ollama emits `{"status":"success"}` OR when /api/tags
-    starts listing the target model. Raises if all attempts fail.
-    """
-    payload = json.dumps({"name": model, "stream": True}).encode("utf-8")
-    last_exc: BaseException | None = None
-    for attempt in range(1, max_attempts + 1):
-        log.info("ollama pull %s (attempt %d/%d, stream=true, "
-                 "per-attempt timeout=%ds)",
-                 model, attempt, max_attempts, timeout)
-        try:
-            req = urllib.request.Request(
-                f"{url.rstrip('/')}/api/pull",
-                data=payload,
-                headers={"Content-Type": "application/json",
-                         "Accept": "application/x-ndjson"},
-                method="POST",
-            )
-            last_log = 0.0
-            saw_success = False
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                for raw_line in resp:  # NDJSON: one event per line
-                    if not raw_line:
-                        continue
-                    try:
-                        evt = json.loads(
-                            raw_line.decode("utf-8", errors="replace"))
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(evt, dict):
-                        continue
-                    err = evt.get("error")
-                    if err:
-                        # Ollama signals fatal pull errors inline (auth
-                        # failure, manifest not found, OOM-on-disk, ...).
-                        # Don't retry — the next attempt would just hit
-                        # the same wall.
-                        raise RuntimeError(f"ollama pull error: {err}")
-                    status_text = evt.get("status") or ""
-                    completed = evt.get("completed")
-                    total = evt.get("total")
-                    now = time.monotonic()
-                    if (now - last_log >= log_every_seconds
-                            or status_text == "success"):
-                        if total:
-                            pct = (float(completed or 0) / float(total)) * 100
-                            log.info("ollama pull %s: %s "
-                                     "(%s / %s, %.1f%%)",
-                                     model, status_text,
-                                     human_bytes(completed),
-                                     human_bytes(total), pct)
-                        elif status_text:
-                            log.info("ollama pull %s: %s",
-                                     model, status_text)
-                        last_log = now
-                    if status_text == "success":
-                        saw_success = True
-                        log.info("ollama pull %s: server reported success",
-                                 model)
-                        return
-            if not saw_success:
-                # Stream ended without a "success" sentinel — could be a
-                # mid-pull EOF (proxy reset). Fall through to retry.
-                last_exc = RuntimeError("stream ended without success event")
-                log.warning("ollama pull %s attempt %d/%d: %s",
-                            model, attempt, max_attempts, last_exc)
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            last_exc = exc
-            log.warning("ollama pull %s attempt %d/%d transport failed: %s",
-                        model, attempt, max_attempts, exc)
-        # Maybe the chart launcher already pulled it — check before sleeping.
-        models, _, _ = ollama_tags(url)
-        if models is not None and model in ollama_model_names(models):
-            log.info("ollama pull %s: target appears in /api/tags after "
-                     "attempt %d — treating as success", model, attempt)
-            return
-        if attempt < max_attempts:
-            log.info("ollama pull %s: sleeping %ds before retry",
-                     model, retry_sleep_seconds)
-            time.sleep(retry_sleep_seconds)
-    raise RuntimeError(
-        f"ollama pull {model!r} failed after {max_attempts} attempts; "
-        f"last error: {last_exc}"
-    )
 
 
 def _measure_ollama_streaming_ttfts(url: str, model: str, prompt: str,
@@ -146,10 +40,12 @@ def _measure_ollama_streaming_ttfts(url: str, model: str, prompt: str,
     We close the connection as soon as both are seen so the server stops
     decoding early and the probe doesn't pay for a full generation.
 
-    Only invoked when `spec.thinking=true` — we trust the config that
-    the model can think, so probe failures (including the famous
-    Ollama-0.10 `HTTP 400 "does not support thinking"`) just degrade
-    `thinking_ttft_seconds` to 0; they don't change `has_thinking`.
+    Only invoked when the runtime ``/api/show`` capability probe
+    reported ``thinking`` support — we trust that signal, so probe
+    failures (including the occasional Ollama-0.10
+    ``HTTP 400 "does not support thinking"`` for half-converted
+    weights) just degrade ``thinking_ttft_seconds`` to 0; they don't
+    change ``has_thinking``.
     """
     payload = {
         "model": model,
@@ -210,8 +106,9 @@ def benchmark_prompt_ollama(url: str, model: str, prompt: str,
     """One non-streaming /api/generate call. Decode server-reported
     durations (nanoseconds) into the unified QuestionResult shape.
 
-    `thinking` is the per-model `spec.thinking` config flag, echoed
-    onto `QuestionResult.has_thinking`. When True, an extra streaming
+    `thinking` reflects the runtime ``/api/show`` capability probe
+    (see ``_step_probe_ollama_thinking``), echoed onto
+    ``QuestionResult.has_thinking``. When True, an extra streaming
     probe runs with `think:true` and fills `thinking_ttft_seconds`
     from the first reasoning chunk. When False, no extra probe runs
     and `thinking_ttft_seconds` is left at 0 (rendered as `—` in the

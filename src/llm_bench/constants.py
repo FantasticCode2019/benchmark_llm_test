@@ -40,7 +40,8 @@ GIB_BYTES: Final[int] = 1024 ** 3
 #: Default timeout (seconds) for one-shot readiness HTTP probes
 #: (``http_get_status``, ``http_get_json``). Long enough to absorb the
 #: TLS handshake on a fresh ingress, short enough that a hung peer is
-#: caught quickly. Polling loops add their own outer deadline on top.
+#: caught quickly — readiness pollers re-issue requests until success
+#: rather than relying on a wall-clock deadline.
 HTTP_DEFAULT_TIMEOUT_SECONDS: Final[int] = 10
 
 # ---------------------------------------------------------------------------
@@ -49,14 +50,10 @@ HTTP_DEFAULT_TIMEOUT_SECONDS: Final[int] = 10
 
 #: Backoff between RETRY-mode probes (transport error, non-2xx, non-JSON,
 #: non-SSE). Decoupled from the happy-path interval so a slow / flapping
-#: chart launcher doesn't slow the steady-state poll cadence.
+#: chart launcher doesn't slow the steady-state poll cadence. The
+#: happy-path interval is now config-driven via
+#: ``readiness_probe_interval_seconds`` (see GlobalDefaults).
 READINESS_FAILURE_RETRY_SECONDS: Final[int] = 5
-
-#: Ollama happy-path poll interval. Ollama has no ``/cfg`` to read
-#: ``probeIntervalMs`` from (it serves a single bundle at a time), so we
-#: hard-code a tight 2s cadence that matches the chart launcher's own
-#: tick rate. vLLM uses the server-supplied interval instead.
-OLLAMA_PROBE_INTERVAL_SECONDS: Final[int] = 2
 
 # ---------------------------------------------------------------------------
 # CLI runner

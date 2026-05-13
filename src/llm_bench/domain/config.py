@@ -131,13 +131,14 @@ class GlobalDefaults:
     install_timeout_minutes: int = 90
     uninstall_timeout_minutes: int = 30
     request_timeout_seconds: int = 1800
-    pull_timeout_seconds: int = 3600
-    api_ready_timeout_minutes: int = 60
-    pull_max_attempts: int = 5
-    pull_retry_sleep_seconds: int = 30
+    # Happy-path poll cadence used by `_poll_ollama_progress` /
+    # `_poll_ollama_health`. The vllm pollers prefer the server-supplied
+    # `cfg.probeIntervalMs` and only fall back here when the server
+    # leaves it unset. Failure-mode retry stays hard-coded at
+    # READINESS_FAILURE_RETRY_SECONDS so a flapping endpoint can't
+    # silently slow down a healthy steady-state poll.
+    readiness_probe_interval_seconds: int = 2
     delete_data: bool = True
-    # The Ollama chart launcher already pulls the model; opt-in only.
-    pull_model: bool = False
     auto_open_internal_entrance: bool = True
     # Legacy alias: when true, force auto_open True regardless of
     # auto_open_internal_entrance. Preserved for old config files.
@@ -180,30 +181,14 @@ class GlobalDefaults:
                 _coerce_int(raw.get("request_timeout_seconds"),
                             field_name="request_timeout_seconds"),
                 base.request_timeout_seconds),
-            pull_timeout_seconds=_first_set(
-                _coerce_int(raw.get("pull_timeout_seconds"),
-                            field_name="pull_timeout_seconds"),
-                base.pull_timeout_seconds),
-            api_ready_timeout_minutes=_first_set(
-                _coerce_int(raw.get("api_ready_timeout_minutes"),
-                            field_name="api_ready_timeout_minutes"),
-                base.api_ready_timeout_minutes),
-            pull_max_attempts=_first_set(
-                _coerce_int(raw.get("pull_max_attempts"),
-                            field_name="pull_max_attempts"),
-                base.pull_max_attempts),
-            pull_retry_sleep_seconds=_first_set(
-                _coerce_int(raw.get("pull_retry_sleep_seconds"),
-                            field_name="pull_retry_sleep_seconds"),
-                base.pull_retry_sleep_seconds),
+            readiness_probe_interval_seconds=_first_set(
+                _coerce_int(raw.get("readiness_probe_interval_seconds"),
+                            field_name="readiness_probe_interval_seconds"),
+                base.readiness_probe_interval_seconds),
             delete_data=_first_set(
                 _coerce_bool(raw.get("delete_data"),
                              field_name="delete_data"),
                 base.delete_data),
-            pull_model=_first_set(
-                _coerce_bool(raw.get("pull_model"),
-                             field_name="pull_model"),
-                base.pull_model),
             auto_open_internal_entrance=_first_set(
                 _coerce_bool(raw.get("auto_open_internal_entrance"),
                              field_name="auto_open_internal_entrance"),
@@ -265,12 +250,8 @@ class ModelSpec:
     install_timeout_minutes: int | None = None
     uninstall_timeout_minutes: int | None = None
     request_timeout_seconds: int | None = None
-    pull_timeout_seconds: int | None = None
-    api_ready_timeout_minutes: int | None = None
-    pull_max_attempts: int | None = None
-    pull_retry_sleep_seconds: int | None = None
+    readiness_probe_interval_seconds: int | None = None
     delete_data: bool | None = None
-    pull_model: bool | None = None
     auto_open_internal_entrance: bool | None = None
     set_public_during_run: bool | None = None
     skip_install_if_running: bool | None = None
@@ -323,24 +304,12 @@ class ModelSpec:
             request_timeout_seconds=_coerce_int(
                 raw.get("request_timeout_seconds"),
                 field_name=f"models[{app_name}].request_timeout_seconds"),
-            pull_timeout_seconds=_coerce_int(
-                raw.get("pull_timeout_seconds"),
-                field_name=f"models[{app_name}].pull_timeout_seconds"),
-            api_ready_timeout_minutes=_coerce_int(
-                raw.get("api_ready_timeout_minutes"),
-                field_name=f"models[{app_name}].api_ready_timeout_minutes"),
-            pull_max_attempts=_coerce_int(
-                raw.get("pull_max_attempts"),
-                field_name=f"models[{app_name}].pull_max_attempts"),
-            pull_retry_sleep_seconds=_coerce_int(
-                raw.get("pull_retry_sleep_seconds"),
-                field_name=f"models[{app_name}].pull_retry_sleep_seconds"),
+            readiness_probe_interval_seconds=_coerce_int(
+                raw.get("readiness_probe_interval_seconds"),
+                field_name=f"models[{app_name}].readiness_probe_interval_seconds"),
             delete_data=_coerce_bool(
                 raw.get("delete_data"),
                 field_name=f"models[{app_name}].delete_data"),
-            pull_model=_coerce_bool(
-                raw.get("pull_model"),
-                field_name=f"models[{app_name}].pull_model"),
             auto_open_internal_entrance=_coerce_bool(
                 raw.get("auto_open_internal_entrance"),
                 field_name=f"models[{app_name}].auto_open_internal_entrance"),
@@ -386,12 +355,8 @@ class ResolvedOptions:
     install_minutes: int
     uninstall_minutes: int
     request_timeout: int
-    pull_timeout: int
-    api_ready_minutes: int
-    pull_max_attempts: int
-    pull_retry_sleep_seconds: int
+    readiness_probe_interval_seconds: int
     delete_data: bool
-    pull_model: bool
     auto_open: bool
     skip_if_running: bool
     preserve_if_existed: bool
@@ -429,17 +394,10 @@ class ResolvedOptions:
                                          defaults.uninstall_timeout_minutes),
             request_timeout=_first_set(spec.request_timeout_seconds,
                                        defaults.request_timeout_seconds),
-            pull_timeout=_first_set(spec.pull_timeout_seconds,
-                                    defaults.pull_timeout_seconds),
-            api_ready_minutes=_first_set(spec.api_ready_timeout_minutes,
-                                         defaults.api_ready_timeout_minutes),
-            pull_max_attempts=_first_set(spec.pull_max_attempts,
-                                         defaults.pull_max_attempts),
-            pull_retry_sleep_seconds=_first_set(
-                spec.pull_retry_sleep_seconds,
-                defaults.pull_retry_sleep_seconds),
+            readiness_probe_interval_seconds=_first_set(
+                spec.readiness_probe_interval_seconds,
+                defaults.readiness_probe_interval_seconds),
             delete_data=_first_set(spec.delete_data, defaults.delete_data),
-            pull_model=_first_set(spec.pull_model, defaults.pull_model),
             auto_open=auto_open,
             skip_if_running=_first_set(spec.skip_install_if_running,
                                        defaults.skip_install_if_running),
@@ -530,20 +488,23 @@ class EmailConfig:
 _KNOWN_ROOT_KEYS = frozenset({
     # Global defaults — handled by GlobalDefaults.from_dict
     "install_timeout_minutes", "uninstall_timeout_minutes",
-    "request_timeout_seconds", "pull_timeout_seconds",
-    "api_ready_timeout_minutes", "pull_max_attempts",
-    "pull_retry_sleep_seconds", "delete_data", "pull_model",
-    "auto_open_internal_entrance", "set_public_during_run",
-    "skip_install_if_running", "preserve_if_existed",
-    "uninstall_after_run", "thinking", "save_pod_logs_on_failure",
-    "pod_logs_dir", "api_type",
+    "request_timeout_seconds", "readiness_probe_interval_seconds",
+    "delete_data", "auto_open_internal_entrance",
+    "set_public_during_run", "skip_install_if_running",
+    "preserve_if_existed", "uninstall_after_run", "thinking",
+    "save_pod_logs_on_failure", "pod_logs_dir", "api_type",
     # Root-only
     "cli_path", "cooldown_seconds", "output_dir", "sudo_password",
     "openai_defaults", "models", "questions", "email",
-    # Legacy fields preserved for forward-compat (not used by the
-    # current implementation but accepted by older configs).
-    "api_ready_probe_interval_seconds",
+    # Legacy fields preserved for forward-compat (silently ignored by
+    # the current implementation but accepted by older configs so a
+    # stale .json doesn't trip the unknown-key warning).
+    "api_ready_timeout_minutes", "api_ready_probe_interval_seconds",
     "warmup_retries", "warmup_retry_sleep_seconds",
+    # Removed when the explicit `ollama /api/pull` escape hatch was
+    # dropped — the chart launcher pulls every supported ollama* chart.
+    "pull_model", "pull_timeout_seconds", "pull_max_attempts",
+    "pull_retry_sleep_seconds",
 })
 
 

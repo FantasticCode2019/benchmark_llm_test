@@ -14,7 +14,6 @@ Phase ordering and failure semantics::
        │  _step_resolve_entrance         (raises -> stop)│
        │  _step_open_entrance            (raises -> stop)│
        │  _step_wait_ready               (raises -> stop)│
-       │  _step_optional_pull            (warns; never raises)│
        │  _step_probe_ollama_thinking    (ollama-only; warns; never raises)│
        │  _step_run_prompts              (per-prompt try; never raises overall)│
        │  _step_describe_ollama_model    (ollama-only; warns; never raises)│
@@ -37,7 +36,7 @@ import time
 from llm_bench.clients.ollama_client import ollama_describe_model, ollama_supports_thinking
 from llm_bench.constants import LOG_NAMESPACE
 from llm_bench.core._context import BenchmarkContext
-from llm_bench.core.benchmark.ollama import benchmark_prompt_ollama, pull_model_ollama
+from llm_bench.core.benchmark.ollama import benchmark_prompt_ollama
 from llm_bench.core.benchmark.openai import benchmark_prompt_openai, openai_config_from
 from llm_bench.core.entrance import ensure_entrance_public, find_entrance
 from llm_bench.core.lifecycle import archive_pod_logs, ensure_installed, market_uninstall
@@ -89,7 +88,6 @@ def bench_model(spec: ModelSpec, prompts: list[str],
         _step_resolve_entrance(ctx)
         _step_open_entrance(ctx)
         _step_wait_ready(ctx)
-        _step_optional_pull(ctx)
         _step_probe_ollama_thinking(ctx)
         _step_run_prompts(ctx)
         _step_describe_ollama_model(ctx)
@@ -184,7 +182,7 @@ def _step_wait_ready(ctx: BenchmarkContext) -> None:
     """
     discovered = wait_until_api_ready(
         ctx.entrance_url, ctx.opts.api_type.value, ctx.model_name,
-        max_wait_minutes=ctx.opts.api_ready_minutes,
+        probe_interval_seconds=ctx.opts.readiness_probe_interval_seconds,
     )
     if discovered and discovered != ctx.model_name:
         log.info("server reports served name as %r (configured %r); "
@@ -195,34 +193,7 @@ def _step_wait_ready(ctx: BenchmarkContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — opt-in explicit ollama /api/pull
-# ---------------------------------------------------------------------------
-
-
-def _step_optional_pull(ctx: BenchmarkContext) -> None:
-    """Run an explicit ``ollama /api/pull`` when requested.
-
-    Disabled by default — every olares-market ``ollama*`` chart ships
-    a launcher that already pulls. Failure is logged as a warning and
-    never propagated: if the model is missing the readiness poll
-    already failed earlier, and if it's present the pull is just noise.
-    """
-    if ctx.opts.api_type is not ApiType.OLLAMA or not ctx.opts.pull_model:
-        return
-    try:
-        pull_model_ollama(
-            ctx.entrance_url, ctx.model_name,
-            timeout=ctx.opts.pull_timeout,
-            max_attempts=ctx.opts.pull_max_attempts,
-            retry_sleep_seconds=ctx.opts.pull_retry_sleep_seconds,
-        )
-    except Exception as exc:  # pull is opt-in; failures are non-fatal
-        log.warning("pull failed (model already present, "
-                    "ignoring): %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Step 5b — ollama-only: probe /api/show for the `thinking` capability
+# Step 5 — ollama-only: probe /api/show for the `thinking` capability
 # ---------------------------------------------------------------------------
 
 
