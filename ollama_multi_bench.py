@@ -1,30 +1,44 @@
 #!/usr/bin/env python3
-"""Multi-model ollama install + sequential multi-round prompt + TTFT report.
+"""Multi-model ollama install + interleaved multi-prompt + TTFT report.
 
 Workflow:
     1. Read a JSON config that declares N (>=1) ollama targets plus the
-       prompts and lifecycle knobs.
+       prompts, lifecycle knobs, and optional SMTP block.
     2. Install every target **sequentially** — one
        `olares-cli market install --watch` after another. Already-running
        apps are reused (override with ``skip_install_if_running: false``).
-    3. After all installs converge, sequentially per target:
+    3. **Phase A — per-target readiness.** For each installed target:
          a. Resolve the entrance + flip to ``public`` if needed.
          b. Poll ``/api/tags`` until the configured model is loaded.
          c. Probe ``/api/show`` once to record whether the model exposes
             the ``thinking`` capability (drives per-prompt ``think:true``
             streaming TTFT probes inside ``benchmark_prompt_ollama``).
-         d. Run every prompt in ``config.prompts`` in order; each round
-            logs TTFT / wall / tokens / tps.
-    4. Print a TTFT-focused summary table (stdout).
-    5. Optionally market-uninstall every target afterwards
-       (``uninstall_after: true``).
+    4. **Phase B — interleaved prompt rounds.** For each prompt in
+       ``config.prompts`` (outer loop), hit every alive target (inner
+       loop, in install order). Per-prompt failures stay on the
+       :class:`QuestionResult`; install / readiness failures stay on
+       the :class:`BenchOutcome` and short-circuit just that target —
+       the other model still gets the prompt. The interleaving means
+       each model is hit ONCE per round before any of them sees the
+       next prompt, so a freshly-evicted model has to reload from
+       disk on every prompt → ``ttft_seconds`` /
+       ``thinking_ttft_seconds`` reflect cold-start behaviour every
+       round (not only the very first one).
+    5. Print a TTFT-focused summary table (stdout) grouped by model so
+       the per-prompt cross-model comparison is obvious.
+    6. When ``config.email`` is set, ship an HTML report + JSON
+       attachment via SMTP using the same retry / TLS path as the
+       main ``llm-bench`` pipeline (mailer.send_email).
+    7. Market-uninstall every target afterwards (default ON via
+       ``uninstall_after: true``). Set the flag to ``false`` to keep
+       the chart warm for iterative debugging.
 
 Run:
     python3 ollama_multi_bench.py -c ollama_multi_bench.example.json
 
 The script is a focused TTFT harness — it intentionally does NOT call
-``bench_model`` / ``write_reports`` / ``send_email``. It's meant to be
-run interactively, not from cron. See ``llm_bench.py`` for the full
+``bench_model`` / ``write_reports``. It's meant to be run
+interactively, not from cron. See ``llm_bench.py`` for the full
 report-and-email pipeline.
 
 Each ``/api/generate`` call is independent (stateless): the "N rounds"
@@ -100,7 +114,11 @@ class BenchConfig:
     readiness_probe_interval_seconds: float = 2.0
     skip_install_if_running: bool = True
     delete_data: bool = True
-    uninstall_after: bool = False
+    # Default ON: this harness is a focused, repeatable TTFT probe;
+    # leaving the chart installed between runs lets state accumulate.
+    # Flip to false during iterative debugging to skip the
+    # post-benchmark `market uninstall` and reuse the warm chart.
+    uninstall_after: bool = True
     cli_path: str | None = None
     log_file: str | None = None
     # Optional SMTP block. When None the script just prints the summary
@@ -353,22 +371,23 @@ def install_sequential(cfg: BenchConfig) -> list[InstallOutcome]:
 
 
 # ---------------------------------------------------------------------------
-# Step B — per-target: entrance → readiness → prompts
+# Step B1 — per-target readiness: entrance → /api/tags → /api/show
 # ---------------------------------------------------------------------------
 
 
-def bench_one_app(outcome: BenchOutcome,
-                  cfg: BenchConfig) -> BenchOutcome:
-    """Resolve the entrance, wait for the model, then run prompts in order.
+def prepare_outcome(outcome: BenchOutcome,
+                    cfg: BenchConfig) -> BenchOutcome:
+    """Resolve the entrance, flip to public, wait for the model to load,
+    then snapshot the runtime ``thinking`` capability. Does NOT send
+    any benchmark prompts — those are driven from the interleaved
+    prompt loop in :func:`main`.
 
-    Expects ``outcome`` to already carry the install-phase fields
-    (``install_decision`` / ``install_duration_seconds`` / ...). Errors
-    during entrance / readiness are captured on ``outcome.error`` and
-    short-circuit *this* target's run; the caller still benches the
-    remaining targets.
+    On any failure ``outcome.error`` is set and the caller skips this
+    outcome from the prompt loop (its ``rounds`` list stays empty so
+    the email / summary still renders a readiness-error row).
     """
     target = outcome.target
-    log.info("=== benchmarking %s (%s) ===",
+    log.info("=== preparing %s (%s) ===",
              target.app_name, target.model_name)
     try:
         entrance, url, auth_level = find_entrance(
@@ -393,29 +412,45 @@ def bench_one_app(outcome: BenchOutcome,
     except Exception as exc:
         log.warning("[probe] %s supports_thinking failed: %s",
                     target.app_name, exc)
-
-    thinking = bool(outcome.supports_thinking)
-    for i, prompt in enumerate(cfg.prompts, start=1):
-        snippet = prompt[:60].replace("\n", " ")
-        log.info("[round %d/%d] %s <- %s",
-                 i, len(cfg.prompts), target.app_name, snippet)
-        qr = benchmark_prompt_ollama(
-            outcome.entrance_url, target.model_name, prompt,
-            request_timeout=cfg.request_timeout_seconds,
-            thinking=thinking,
-        )
-        outcome.rounds.append(qr)
-        if qr.ok:
-            think = ""
-            if (qr.thinking_ttft_seconds
-                    and qr.thinking_ttft_seconds != qr.ttft_seconds):
-                think = f" think_ttft={qr.thinking_ttft_seconds:.3f}s"
-            log.info("  -> ttft=%.3fs%s wall=%.3fs tokens=%d tps=%.2f",
-                     qr.ttft_seconds, think, qr.wall_seconds,
-                     qr.eval_count, qr.tps)
-        else:
-            log.warning("  -> error: %s", qr.error)
     return outcome
+
+
+# ---------------------------------------------------------------------------
+# Step B2 — single prompt against one outcome
+# ---------------------------------------------------------------------------
+
+
+def run_prompt_on(outcome: BenchOutcome, prompt: str, *,
+                  round_index: int, total_rounds: int,
+                  cfg: BenchConfig) -> None:
+    """Send ONE prompt to ``outcome``'s model and append the resulting
+    :class:`QuestionResult` to ``outcome.rounds`` (in prompt order).
+
+    Per-prompt failures live on ``QuestionResult.error`` — we never
+    raise here so a bad prompt against one model can't take down the
+    interleaved loop's other models.
+    """
+    target = outcome.target
+    thinking = bool(outcome.supports_thinking)
+    snippet = prompt[:60].replace("\n", " ")
+    log.info("[prompt %d/%d] %s <- %s",
+             round_index, total_rounds, target.app_name, snippet)
+    qr = benchmark_prompt_ollama(
+        outcome.entrance_url, target.model_name, prompt,
+        request_timeout=cfg.request_timeout_seconds,
+        thinking=thinking,
+    )
+    outcome.rounds.append(qr)
+    if qr.ok:
+        think = ""
+        if (qr.thinking_ttft_seconds
+                and qr.thinking_ttft_seconds != qr.ttft_seconds):
+            think = f" think_ttft={qr.thinking_ttft_seconds:.3f}s"
+        log.info("  -> ttft=%.3fs%s wall=%.3fs tokens=%d tps=%.2f",
+                 qr.ttft_seconds, think, qr.wall_seconds,
+                 qr.eval_count, qr.tps)
+    else:
+        log.warning("  -> error: %s", qr.error)
 
 
 # ---------------------------------------------------------------------------
@@ -721,9 +756,11 @@ def main() -> int:
     stamp = utc_now_naive().strftime("%Y%m%d_%H%M%S")
 
     installs = install_sequential(cfg)
-    # Build one outcome per target. Install failures still produce an
-    # outcome (with install_error populated) so the summary + email show
-    # the failure reason instead of silently skipping the row.
+    # Phase A — build one outcome per target and do readiness/thinking
+    # probe per target. Install or readiness failures still produce an
+    # outcome (with `install_error` / `error` populated) so the summary
+    # + email show the failure reason instead of silently skipping the
+    # row.
     outcomes: list[BenchOutcome] = []
     for inst in installs:
         outcome = BenchOutcome(
@@ -738,7 +775,25 @@ def main() -> int:
                         inst.target.app_name)
             outcomes.append(outcome)
             continue
-        outcomes.append(bench_one_app(outcome, cfg))
+        prepare_outcome(outcome, cfg)
+        outcomes.append(outcome)
+
+    # Phase B — interleaved prompts: for each prompt, hit every alive
+    # outcome in install order. This gives every model a fresh
+    # disk->VRAM load between prompts (the other model evicts it from
+    # VRAM in between), so `ttft_seconds` / `thinking_ttft_seconds`
+    # reflect cold-start behaviour on EVERY round instead of only the
+    # very first one as in the old per-model loop.
+    total = len(cfg.prompts)
+    for i, prompt in enumerate(cfg.prompts, start=1):
+        log.info("=== prompt round %d/%d across %d model(s) ===",
+                 i, total, sum(1 for o in outcomes if o.reached_prompts))
+        for outcome in outcomes:
+            if not outcome.reached_prompts:
+                continue
+            run_prompt_on(outcome, prompt,
+                          round_index=i, total_rounds=total,
+                          cfg=cfg)
 
     print_summary(outcomes)
     send_summary_email(cfg, outcomes, stamp=stamp)

@@ -7,7 +7,7 @@
   "readiness_probe_interval_seconds": 2.0,
   "skip_install_if_running": true,
   "delete_data": true,
-  "uninstall_after": false,
+  "uninstall_after": true,
   "models": [
     {
       "app_name": "ollamadeepseekr18b",
