@@ -1,0 +1,26 @@
+{
+  "cli_path": "/home/olares/test/olares-cli",
+  "log_file": "/tmp/ollama_multi_bench.log",
+  "install_minutes": 90,
+  "uninstall_minutes": 30,
+  "request_timeout_seconds": 1800,
+  "readiness_probe_interval_seconds": 2.0,
+  "skip_install_if_running": true,
+  "delete_data": true,
+  "uninstall_after": false,
+  "models": [
+    {
+      "app_name": "ollamadeepseekr18b",
+      "model_name": "deepseek-r1:8b"
+    },
+    {
+      "app_name": "ollamaqwen3qwen32b",
+      "model_name": "qwen3:32b"
+    }
+  ],
+  "prompts": [
+    "你好，请用一句话介绍下你自己。",
+    "1+1 等于几？请说明你的推理过程。",
+    "用一句话总结你上一回合的回答。"
+  ]
+}

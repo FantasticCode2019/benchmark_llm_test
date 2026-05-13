@@ -83,6 +83,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B011"]
+# Interactive harness ships Chinese sample prompts whose fullwidth
+# punctuation is *intentional* — they're the literal text we POST.
+"ollama_multi_bench.py" = ["RUF001", "RUF002"]
 
 [tool.mypy]
 python_version = "3.11"
