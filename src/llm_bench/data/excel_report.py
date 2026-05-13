@@ -13,8 +13,8 @@ Column layout (kept stable; mirrored by the column header row):
     Model                   spec.model_name (server-discovered when applicable)
     API                     always "ollama" in this sheet
     Supports Thinking       runtime probe via /api/show capabilities[]
-    spec.thinking           configured intent (drives the streaming TTFT probe)
-    Has Think (config)      "Yes" / "No" echo of spec.thinking, per-row aware
+                            (also drives whether the streaming TTFT
+                            probe runs — see orchestrator._run_one_prompt)
     Family                  /api/show details.family
     Parameter Size          /api/show details.parameter_size
     Quantization            /api/show details.quantization_level
@@ -71,8 +71,6 @@ _COLUMNS: list[tuple[str, str]] = [
     ("Model",                "model"),
     ("API",                  "api_type"),
     ("Supports Thinking",    "ollama_supports_thinking"),
-    ("spec.thinking",        "spec_thinking"),
-    ("Has Think (config)",   "has_thinking_label"),
     ("Family",               "family"),
     ("Parameter Size",       "parameter_size"),
     ("Quantization",         "quantization"),
@@ -127,8 +125,6 @@ def _row_for(result: ModelResult) -> list[Any]:
         "api_type": str(result.api_type),
         "ollama_supports_thinking": _format_tristate_bool(
             result.ollama_supports_thinking),
-        "spec_thinking": _format_spec_thinking(result),
-        "has_thinking_label": result.has_thinking_label(),
         "family": _descriptor_field(result, "family"),
         "parameter_size": _descriptor_field(result, "parameter_size"),
         "quantization": _descriptor_field(result, "quantization"),
@@ -168,18 +164,6 @@ def _format_tristate_bool(value: bool | None) -> str:
     if value is False:
         return "No"
     return ""
-
-
-def _format_spec_thinking(result: ModelResult) -> str:
-    """Per-row ``spec.thinking`` echo. We don't have direct access to
-    the ``spec`` here, but every successful ``QuestionResult`` carries
-    the same flag in ``has_thinking`` (set per-prompt from the same
-    config knob). Falls back to the model-level helper if every prompt
-    failed.
-    """
-    for q in result.questions:
-        return "true" if q.has_thinking else "false"
-    return "true" if result.has_thinking_label() == "Yes" else "false"
 
 
 def _style_header(ws) -> None:

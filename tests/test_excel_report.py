@@ -109,10 +109,11 @@ class TestRenderOllamaExcel:
         assert ollama_row["App"] == "ollama-qwen3"
         assert ollama_row["Model"] == "qwen3:8b"
         assert ollama_row["API"] == "ollama"
-        # Runtime probe + spec.thinking echoes
+        # Runtime probe is the sole thinking signal in the workbook.
         assert ollama_row["Supports Thinking"] == "Yes"
-        assert ollama_row["spec.thinking"] == "true"
-        assert ollama_row["Has Think (config)"] == "Yes"
+        # Defensive: the dropped redundant columns must NOT come back.
+        assert "spec.thinking" not in header
+        assert "Has Think (config)" not in header
         # Descriptor fields
         assert ollama_row["Family"] == "qwen3"
         assert ollama_row["Parameter Size"] == "8.2B"

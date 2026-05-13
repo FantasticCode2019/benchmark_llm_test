@@ -37,14 +37,12 @@
     {
       "app_name": "ollamadeepseekr114bv2",
       "model_name": "deepseek-r1:14b",
-      "api_type": "ollama",
-      "thinking": true
+      "api_type": "ollama"
     },
     {
       "app_name": "ollamaqwen314bv2",
       "model_name": "qwen3:14b",
-      "api_type": "ollama",
-      "thinking": true
+      "api_type": "ollama"
     },
     {
       "app_name": "vllmgemma312bitv2",

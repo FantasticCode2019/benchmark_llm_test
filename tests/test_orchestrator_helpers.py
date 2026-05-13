@@ -12,6 +12,7 @@ import logging
 from llm_bench.core._context import BenchmarkContext
 from llm_bench.core.orchestrator import (
     _log_prompt_result,
+    _run_one_prompt,
     _step_describe_ollama_model,
     _step_probe_ollama_thinking,
 )
@@ -211,6 +212,124 @@ class TestOllamaSupportsThinkingStep:
         assert ctx.result.ollama_supports_thinking is None
         assert any("ollama_supports_thinking" in rec.message
                    for rec in caplog.records)
+
+
+class TestRunOnePromptDispatch:
+    """``_run_one_prompt`` is the single fan-out point that injects the
+    ``thinking`` flag into each backend. The rule is:
+
+      * ollama -> runtime probe (``ctx.result.ollama_supports_thinking``);
+                  config (``spec.thinking``) is intentionally ignored.
+      * openai -> config (``ctx.opts.thinking``); no probe exists.
+
+    These tests pin both branches so a future refactor doesn't silently
+    re-couple ollama's thinking flag to the config.
+    """
+
+    def test_ollama_uses_runtime_probe_true(self, monkeypatch):
+        ctx = _make_ctx(api_type=ApiType.OLLAMA)
+        # Probe says yes; config is irrelevant (left at default = False).
+        ctx.result.ollama_supports_thinking = True
+        captured: dict = {}
+
+        def fake_ollama(*args, **kwargs):
+            captured.update(kwargs)
+            return QuestionResult(prompt="q", ok=True)
+
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.benchmark_prompt_ollama", fake_ollama)
+        _run_one_prompt(ctx, "q")
+        assert captured["thinking"] is True
+
+    def test_ollama_uses_runtime_probe_false(self, monkeypatch):
+        ctx = _make_ctx(api_type=ApiType.OLLAMA)
+        ctx.result.ollama_supports_thinking = False
+        captured: dict = {}
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.benchmark_prompt_ollama",
+            lambda *a, **kw: (captured.update(kw)
+                              or QuestionResult(prompt="q", ok=True)))
+        _run_one_prompt(ctx, "q")
+        assert captured["thinking"] is False
+
+    def test_ollama_probe_none_falls_back_to_false(self, monkeypatch):
+        """Probe step failed / hasn't run yet — we treat None as "don't
+        know, don't pay for an extra streaming probe" rather than
+        falling back to the (now-ignored) config value.
+        """
+        ctx = _make_ctx(api_type=ApiType.OLLAMA)
+        ctx.result.ollama_supports_thinking = None
+        captured: dict = {}
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.benchmark_prompt_ollama",
+            lambda *a, **kw: (captured.update(kw)
+                              or QuestionResult(prompt="q", ok=True)))
+        _run_one_prompt(ctx, "q")
+        assert captured["thinking"] is False
+
+    def test_ollama_ignores_config_thinking(self, monkeypatch):
+        """spec.thinking=true must NOT push thinking=True into the
+        ollama benchmark when the runtime probe said no.
+        """
+        spec = ModelSpec(app_name="appX", model_name="mX",
+                         api_type=ApiType.OLLAMA, thinking=True)
+        defaults = GlobalDefaults()
+        cfg = AppConfig(
+            defaults=defaults, models=[spec], questions=["q"],
+            email=EmailConfig(smtp_host="h", smtp_port=587, username="u",
+                              password="p", sender="u@x", to="u@x"),
+        )
+        ctx = BenchmarkContext(
+            spec=spec, cfg=cfg,
+            opts=ResolvedOptions.for_model(spec, defaults),
+            openai=OpenAIConfig(),
+            result=ModelResult(app_name="appX", model="mX",
+                               api_type=ApiType.OLLAMA),
+            model_name="mX",
+        )
+        ctx.entrance_url = "http://ollama.local"
+        ctx.result.ollama_supports_thinking = False  # probe says no
+        assert ctx.opts.thinking is True             # config says yes
+
+        captured: dict = {}
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.benchmark_prompt_ollama",
+            lambda *a, **kw: (captured.update(kw)
+                              or QuestionResult(prompt="q", ok=True)))
+        _run_one_prompt(ctx, "q")
+        # Probe wins over config.
+        assert captured["thinking"] is False
+
+    def test_openai_still_uses_config_thinking(self, monkeypatch):
+        """The openai/vLLM branch must keep reading ``ctx.opts.thinking``
+        because vLLM's ``/v1/models`` has no equivalent capability
+        metadata to probe against.
+        """
+        spec = ModelSpec(app_name="appX", model_name="mX",
+                         api_type=ApiType.OPENAI, thinking=True)
+        defaults = GlobalDefaults()
+        cfg = AppConfig(
+            defaults=defaults, models=[spec], questions=["q"],
+            email=EmailConfig(smtp_host="h", smtp_port=587, username="u",
+                              password="p", sender="u@x", to="u@x"),
+        )
+        ctx = BenchmarkContext(
+            spec=spec, cfg=cfg,
+            opts=ResolvedOptions.for_model(spec, defaults),
+            openai=OpenAIConfig(),
+            result=ModelResult(app_name="appX", model="mX",
+                               api_type=ApiType.OPENAI),
+            model_name="mX",
+        )
+        ctx.entrance_url = "http://vllm.local"
+
+        captured: dict = {}
+        monkeypatch.setattr(
+            "llm_bench.core.orchestrator.benchmark_prompt_openai",
+            lambda *a, **kw: (captured.update(kw)
+                              or QuestionResult(prompt="q", ok=True)))
+        _run_one_prompt(ctx, "q")
+        assert captured["thinking"] is True
 
 
 class TestOllamaDescribeModelStep:

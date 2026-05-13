@@ -155,8 +155,8 @@ benchmark_llm_test/
 |---|---|---|---|
 | `wall_seconds` | ✓ | ✓ | 客户端端到端 round-trip |
 | `ttft_seconds` | server 精确 | `spec.thinking=true` 时取流式探针的 first-content delta；否则 max_tokens=1 近似 | "思考之后" 的首个回答 token 时间。带 thinking 的模型代表 reasoning trace 结束后开始吐 `content` 的时刻 |
-| `thinking_ttft_seconds` | `spec.thinking=true` 时由 `stream=true,think=true` 探针的首个 thinking 块时间填；否则 0 | `spec.thinking=true` 时由 `chat_template_kwargs.thinking=true` 流式探针的首个 `delta.reasoning` / `delta.reasoning_content` 填；否则 0 | "思考中" 第一个 token 时间。`spec.thinking=false` 或探针没拿到 reasoning 块时为 0（邮件里显示 `—`） |
-| `has_thinking` | 直接回写 `spec.thinking` | 直接回写 `spec.thinking` | bool，**完全由配置决定**，不做运行时检测。邮件表里聚合成 `Has Think` 列的 `Yes` / `No` |
+| `thinking_ttft_seconds` | `/api/show` 运行时探到 `thinking` 能力时由 `stream=true,think=true` 探针的首个 thinking 块时间填；否则 0 | `spec.thinking=true` 时由 `chat_template_kwargs.thinking=true` 流式探针的首个 `delta.reasoning` / `delta.reasoning_content` 填；否则 0 | "思考中" 第一个 token 时间。能力探测为 false / `spec.thinking=false` 或探针没拿到 reasoning 块时为 0（邮件里显示 `—`） |
+| `has_thinking` | 回写 ollama 运行时探测结果（`/api/show capabilities` 是否包含 `thinking`），**配置不再参与**；探测失败时回退为 false | 直接回写 `spec.thinking` | bool。**ollama 完全自动检测，openai/vLLM 仍由配置决定**（vLLM 的 `/v1/models` 没有等价的能力字段）。邮件表里聚合成 `Has Think` 列的 `Yes` / `No` |
 | `eval_count` | server 报 | `usage.completion_tokens` 或字符估算 | 生成的 token 数 |
 | `eval_seconds` | server 报 | llama.cpp `timings.predicted_ms` 才有 | decode 用时 |
 | `tps` | server decode-only | server（llama.cpp）或 client（vLLM） | 主要 TPS 指标 |
@@ -210,7 +210,7 @@ benchmark_llm_test/
 | `save_pod_logs_on_failure` | `true` | 模型流程失败（install/readiness/benchmark/uninstall 任一阶段报错，或 chart 起来了但所有 prompt 都失败）时，把 `/var/log/pods/*<app_name>*` 这些目录 `tar -czf` 成 `<pod_logs_dir>/<app>_logs_<UTCstamp>.tar.gz`。**uninstall 之前**就归档（uninstall 会把 pod 一并清掉）。归档路径会写进 JSON 的 `pod_logs_archive` 字段，HTML 报表对应行的红色副标题里也会显示 |
 | `pod_logs_dir` | `/tmp` | 归档 tarball 的输出目录，自动创建 |
 | `sudo_password` | `""` | `/var/log/pods/` 在大多数 Olares 主机上是 root-only。脚本以非 root 跑时填这里：归档会自动改走 `sudo -S tar`（密码经 stdin 注入，**不**进 argv、**不**入日志），完事后 `sudo chown` 把 tarball 物归原主。**安全提示**：这是明文密码，建议把 config 文件 `chmod 600` 并加进 `.gitignore`；若以 root 直接跑或 `/var/log/pods` 已经放开了读权限，留空即可，归档走普通 `tar`。 |
-| `thinking` | `false` | 模型带「思考 / reasoning」阶段时设为 true（DeepSeek-R1 / Qwen3 / GPT-OSS / o1-style 这类）：脚本会在每条 prompt 上额外发一个流式探针（ollama 走 `stream=true,think=true` /api/generate；openai 走 `stream=true` /v1/chat/completions + `extra_body.chat_template_kwargs.thinking=true`），只读到第一个 reasoning delta + 第一个 content delta 就主动断开，分别填进 `thinking_ttft_seconds` 和 `ttft_seconds`。**`has_thinking` 直接回写本字段**，邮件 `Has Think` 列也直接由它决定，不做运行时检测 |
+| `thinking` | `false` | 模型带「思考 / reasoning」阶段时设为 true（DeepSeek-R1 / Qwen3 / GPT-OSS / o1-style 这类）：脚本会在每条 prompt 上额外发一个流式探针，只读到第一个 reasoning delta + 第一个 content delta 就主动断开，分别填进 `thinking_ttft_seconds` 和 `ttft_seconds`。**仅对 openai / vLLM 生效**（vLLM 走 `stream=true` /v1/chat/completions + `extra_body.chat_template_kwargs.thinking=true`）。**ollama 完全忽略本字段**：每个模型 install + 权重就绪后，脚本会调一次 `/api/show` 拿 `capabilities[]`，由那里是否含 `thinking` 决定要不要发 `stream=true,think=true` /api/generate 流式探针；`has_thinking` 也由这个运行时探测填，不再回写配置 |
 | `openai_defaults` | 见下表 | 全局 openai-shape 采样参数 |
 | `email` | **必填** | SMTP 配置，见下表 |
 

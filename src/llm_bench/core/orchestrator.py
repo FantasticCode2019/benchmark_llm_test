@@ -230,15 +230,19 @@ def _step_probe_ollama_thinking(ctx: BenchmarkContext) -> None:
     """Runtime detection of whether the loaded ollama model exposes the
     ``thinking`` capability via /api/show.
 
-    Distinct from ``ctx.opts.thinking`` / ``spec.thinking`` — those are
-    *user intent* (drives the streaming TTFT probe in the benchmark);
-    this one is *ground truth* read from the daemon and recorded on
-    ``ctx.result.ollama_supports_thinking`` so the Excel attachment can
-    show the actual capability map next to the configured flag.
+    For ollama, this probe result is the **sole source of truth** for
+    whether ``_run_one_prompt`` triggers the streaming `think:true`
+    TTFT probe — ``spec.thinking`` / ``ctx.opts.thinking`` are
+    intentionally NOT consulted for ollama models. The /api/show
+    ``capabilities[]`` array is authoritative, so a config knob would
+    only be a way to disagree with the daemon.
 
-    Best-effort: any failure logs a warning and leaves the field at None
-    so downstream consumers can tell "probe didn't run" apart from a
-    truthy / falsy answer.
+    (OpenAI / vLLM still honour ``ctx.opts.thinking`` because
+    ``/v1/models`` exposes no equivalent capability metadata to probe.)
+
+    Best-effort: any failure logs a warning and leaves the field at
+    None. ``_run_one_prompt`` coerces None to False, i.e. "we don't
+    know, don't pay for an extra streaming probe."
     """
     if ctx.opts.api_type is not ApiType.OLLAMA:
         return
@@ -251,8 +255,8 @@ def _step_probe_ollama_thinking(ctx: BenchmarkContext) -> None:
         return
     ctx.result.ollama_supports_thinking = supports
     log.info("%s: ollama runtime supports_thinking=%s "
-             "(configured spec.thinking=%s)",
-             ctx.app, supports, ctx.opts.thinking)
+             "(spec.thinking is ignored for ollama models)",
+             ctx.app, supports)
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +280,25 @@ def _step_run_prompts(ctx: BenchmarkContext) -> None:
 
 
 def _run_one_prompt(ctx: BenchmarkContext, prompt: str) -> QuestionResult:
-    """Dispatch a single prompt to the correct backend."""
+    """Dispatch a single prompt to the correct backend.
+
+    Thinking flag source-of-truth by backend:
+
+      * **ollama** — taken from the runtime probe recorded by
+        :func:`_step_probe_ollama_thinking`
+        (``ctx.result.ollama_supports_thinking``). The /api/show
+        ``capabilities[]`` array is authoritative, so we ignore the
+        ``spec.thinking`` config knob entirely for this backend.
+        A probe that failed leaves the field at None — we treat that
+        as "we don't know, don't pay for an extra streaming probe"
+        and pass ``False``.
+      * **openai / vLLM** — still ``ctx.opts.thinking`` (config). vLLM's
+        ``/v1/models`` does NOT expose per-model capability metadata,
+        so there's nothing to auto-detect against; the user has to
+        tell us up front whether to inject
+        ``chat_template_kwargs={"thinking":true}`` into the streaming
+        probe.
+    """
     if ctx.opts.api_type is ApiType.OPENAI:
         return benchmark_prompt_openai(
             ctx.entrance_url, ctx.model_name, prompt, ctx.openai,
@@ -286,7 +308,7 @@ def _run_one_prompt(ctx: BenchmarkContext, prompt: str) -> QuestionResult:
     return benchmark_prompt_ollama(
         ctx.entrance_url, ctx.model_name, prompt,
         request_timeout=ctx.opts.request_timeout,
-        thinking=ctx.opts.thinking,
+        thinking=bool(ctx.result.ollama_supports_thinking),
     )
 
 
