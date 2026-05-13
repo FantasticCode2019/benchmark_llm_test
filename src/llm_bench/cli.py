@@ -96,7 +96,7 @@ def main() -> int:
         return 0
 
     try:
-        send_email(artifacts.html, artifacts.json_dump, cfg,
+        send_email(cfg.email, artifacts.html, artifacts.json_dump,
                    stamp=stamp,
                    excel_bytes=artifacts.excel_bytes or None)
     except Exception:

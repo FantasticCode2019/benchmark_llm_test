@@ -22,5 +22,18 @@
     "你好，请用一句话介绍下你自己。",
     "1+1 等于几？请说明你的推理过程。",
     "用一句话总结你上一回合的回答。"
-  ]
+  ],
+  "email": {
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 465,
+    "use_ssl": true,
+    "smtp_timeout": 120,
+    "smtp_retries": 3,
+    "smtp_retry_backoff": 5,
+    "username": "you@example.com",
+    "password": "<gmail-app-password>",
+    "from": "you@example.com",
+    "to": "you@example.com",
+    "subject": "Ollama multi-bench {datetime}"
+  }
 }

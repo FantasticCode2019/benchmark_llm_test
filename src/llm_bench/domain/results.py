@@ -40,20 +40,27 @@ class QuestionResult:
           are populated from `usage` and `timings` blocks
 
     Thinking (DeepSeek-R1 / Qwen3 / GPT-OSS / o1-style):
-      - `ttft_seconds` reflects the model's NATURAL behavior — for a
-        thinking model this is the time to the FIRST ANSWER token
-        (after the reasoning trace ends).
-      - `thinking_ttft_seconds` is the time the model takes to emit its
-        FIRST reasoning/thinking token (Ollama `message.thinking`,
-        vLLM `delta.reasoning` / `delta.reasoning_content`). Only
-        measured when `spec.thinking=true` in the config — we trust
-        the user to know whether the model has a thinking phase. For
-        non-thinking models (or when the streaming probe failed) it
-        is left at 0.0 (rendered as `—` in the email).
-      - `has_thinking`: ECHOED FROM `spec.thinking` in the config.
-        Set on every prompt of the run so the JSON attachment still
-        carries the per-row signal even though it's now uniform per
-        model.
+      - `ttft_seconds` is the **non-streaming aggregate approximation**
+        of "model load + prefill" time — i.e. `load_duration +
+        prompt_eval_duration` read from the server's stats on the
+        final chunk. It does NOT depend on whether the model emitted
+        thinking; it's a server-side, deterministic number that's
+        cheap to compute and useful as a baseline.
+      - `thinking_ttft_seconds` is the **client-side wall-clock TTFT
+        for the reasoning phase**, computed as
+        `first_thinking_chunk_arrival + load_duration` for ollama
+        (or `first_reasoning_chunk_arrival` for vLLM). The
+        `+ load_duration` correction explicitly folds in the model
+        load time so the metric reflects cold-start behaviour even on
+        a hot daemon that pre-warmed the model. Populated only when
+        the runtime probe (ollama) or config (vLLM) reported thinking
+        support AND the model actually emitted a thinking chunk. Left
+        at 0.0 otherwise (rendered as `—` in the email).
+      - `has_thinking`: for ollama, ECHOED FROM the runtime
+        `ollama_supports_thinking` probe; for openai/vLLM, ECHOED FROM
+        `spec.thinking` config. Set on every prompt of the run so the
+        JSON attachment still carries the per-row signal even though
+        it's uniform per model.
     """
     prompt: str
     ok: bool = False

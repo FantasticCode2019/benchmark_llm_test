@@ -10,7 +10,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 from llm_bench.constants import LOG_NAMESPACE
-from llm_bench.domain import AppConfig, EmailConfig
+from llm_bench.domain import EmailConfig
 from llm_bench.utils.time_utils import utc_now_naive
 
 log = logging.getLogger(LOG_NAMESPACE)
@@ -58,9 +58,11 @@ def _resolve_use_ssl(email: EmailConfig) -> bool:
     return email.smtp_port == 465
 
 
-def send_email(html: str, json_dump: str, cfg: AppConfig,
+def send_email(email: EmailConfig, html: str, json_dump: str,
                *, stamp: str,
-               excel_bytes: bytes | None = None) -> None:
+               excel_bytes: bytes | None = None,
+               json_filename: str | None = None,
+               excel_filename: str | None = None) -> None:
     """Build the MIME message and ship it over SMTP, with retry on
     transport errors only.
 
@@ -77,8 +79,13 @@ def send_email(html: str, json_dump: str, cfg: AppConfig,
     ``application/vnd.openxmlformats-officedocument.spreadsheetml.sheet``.
     Pass None / empty bytes (the default) to suppress the attachment —
     used by runs that contained no Ollama models.
+
+    ``json_filename`` / ``excel_filename`` override the default
+    ``llm_bench_<stamp>.{json,xlsx}`` attachment names — useful when a
+    side-channel harness (e.g. ``ollama_multi_bench``) wants to ship
+    differently-branded attachments without confusing them with the
+    main pipeline's outputs.
     """
-    email = cfg.email
     msg = MIMEMultipart("mixed")
     msg["Subject"] = _render_subject(email.subject, stamp)
     msg["From"] = email.sender
@@ -93,15 +100,16 @@ def send_email(html: str, json_dump: str, cfg: AppConfig,
 
     att = MIMEApplication(json_dump.encode("utf-8"), _subtype="json")
     att.add_header("Content-Disposition", "attachment",
-                   filename=f"llm_bench_{stamp}.json")
+                   filename=json_filename or f"llm_bench_{stamp}.json")
     msg.attach(att)
 
     if excel_bytes:
         xlsx = MIMEApplication(
             excel_bytes,
             _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        xlsx.add_header("Content-Disposition", "attachment",
-                        filename=f"llm_bench_ollama_{stamp}.xlsx")
+        xlsx.add_header(
+            "Content-Disposition", "attachment",
+            filename=excel_filename or f"llm_bench_ollama_{stamp}.xlsx")
         msg.attach(xlsx)
 
     use_ssl = _resolve_use_ssl(email)
