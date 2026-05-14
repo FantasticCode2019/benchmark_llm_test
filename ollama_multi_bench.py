@@ -68,7 +68,11 @@ from llm_bench.clients.ollama_client import ollama_supports_thinking  # noqa: E4
 from llm_bench.constants import DEFAULT_OLARES_CLI, LOG_NAMESPACE  # noqa: E402
 from llm_bench.core.benchmark.ollama import benchmark_prompt_ollama  # noqa: E402
 from llm_bench.core.entrance import ensure_entrance_public, find_entrance  # noqa: E402
-from llm_bench.core.lifecycle import ensure_installed, market_uninstall  # noqa: E402
+from llm_bench.core.lifecycle import (  # noqa: E402
+    MarketInstallFailed,
+    ensure_installed,
+    market_uninstall,
+)
 from llm_bench.core.readiness import wait_until_api_ready  # noqa: E402
 from llm_bench.data.config import setup_logging  # noqa: E402
 from llm_bench.data.mailer import send_email  # noqa: E402
@@ -193,7 +197,7 @@ class BenchConfig:
             skip_install_if_running=_bool(
                 raw, "skip_install_if_running", True),
             delete_data=_bool(raw, "delete_data", True),
-            uninstall_after=_bool(raw, "uninstall_after", False),
+            uninstall_after=_bool(raw, "uninstall_after", True),
             cli_path=_optional_str(raw, "cli_path"),
             log_file=_optional_str(raw, "log_file"),
             email=email_cfg,
@@ -268,12 +272,47 @@ def load_config(path: str) -> BenchConfig:
 class InstallOutcome:
     """Result of one ``ensure_installed`` call. Folded into the
     corresponding :class:`BenchOutcome` before reporting.
+
+    ``install_status`` is the parsed ``-o json`` payload from
+    ``olares-cli market install``; populated on FRESH / RECOVERED
+    paths (success OR failure) and ``None`` on the REUSED path or
+    when the CLI errored before printing JSON.
     """
     target: TargetModel
     duration_seconds: float
     decision: str
     already_existed: bool
+    install_status: dict | None = None
     error: str | None = None
+
+
+def derive_model_exists(*, install_status: dict | None,
+                        install_error: str | None,
+                        install_decision: str) -> bool | None:
+    """Tri-state mapping for the "model exists" column.
+
+    True   -> chart name resolved and reached ``running`` after install
+              (or it was already running on the REUSED path).
+    False  -> CLI reported ``status == "failed"``, which per the
+              olares-market convention means the app name does not
+              exist in any registered source.
+    None   -> insufficient info (older CLI with no JSON, transport
+              error before status was emitted, unknown status string).
+
+    Centralised so the email / JSON / stdout renderers all agree.
+    """
+    if isinstance(install_status, dict):
+        st = str(install_status.get("status") or "").strip().lower()
+        if st == "success":
+            return True
+        if st == "failed":
+            return False
+        return None
+    # No JSON payload. REUSED with no install_error means the app was
+    # already running — the chart name clearly resolved.
+    if install_error is None and install_decision == "reused":
+        return True
+    return None
 
 
 @dataclass
@@ -282,12 +321,20 @@ class BenchOutcome:
     round. ``install_error`` non-None means we never got to readiness;
     ``error`` non-None means we got past install but failed readiness /
     entrance setup. Per-prompt failures live on each ``QuestionResult``.
+
+    ``install_status`` mirrors :class:`InstallOutcome.install_status`
+    (parsed ``market install -o json`` payload); ``model_exists`` is
+    the tri-state convenience flag derived from it via
+    :func:`derive_model_exists`. Both are reported in the JSON
+    attachment, HTML email body, and stdout summary.
     """
     target: TargetModel
     install_decision: str = ""
     install_duration_seconds: float = 0.0
     install_already_existed: bool = False
+    install_status: dict | None = None
     install_error: str | None = None
+    model_exists: bool | None = None
     entrance_url: str = ""
     supports_thinking: bool | None = None
     rounds: list[QuestionResult] = field(default_factory=list)
@@ -320,7 +367,7 @@ class BenchOutcome:
 def _install_one(target: TargetModel, cfg: BenchConfig) -> InstallOutcome:
     started = time.perf_counter()
     try:
-        already_existed, decision = ensure_installed(
+        already_existed, decision, install_status = ensure_installed(
             target.app_name,
             install_minutes=cfg.install_minutes,
             uninstall_minutes=cfg.uninstall_minutes,
@@ -333,6 +380,20 @@ def _install_one(target: TargetModel, cfg: BenchConfig) -> InstallOutcome:
             duration_seconds=round(time.perf_counter() - started, 1),
             decision=decision.value,
             already_existed=already_existed,
+            install_status=install_status,
+        )
+    except MarketInstallFailed as exc:
+        # The CLI conclusively reported a failure status; if `exc.status`
+        # is populated we know whether it was "app name doesn't exist"
+        # (status="failed") vs an exit before status was emitted (None).
+        log.error("install %s failed: %s", target.app_name, exc)
+        return InstallOutcome(
+            target=target,
+            duration_seconds=round(time.perf_counter() - started, 1),
+            decision="failed",
+            already_existed=False,
+            install_status=exc.status,
+            error=str(exc),
         )
     except Exception as exc:
         log.exception("install %s failed", target.app_name)
@@ -468,16 +529,19 @@ def print_summary(outcomes: list[BenchOutcome]) -> None:
     print("=" * 78)
     for o in outcomes:
         header = f"{o.target.app_name} ({o.target.model_name})"
+        exists_label = _model_exists_label(o.model_exists)
 
         if o.install_error:
             print(f"\n[{header}] INSTALL FAILED in "
-                  f"{o.install_duration_seconds:.1f}s: {o.install_error}")
+                  f"{o.install_duration_seconds:.1f}s "
+                  f"(model_exists={exists_label}): {o.install_error}")
             continue
 
         print(f"\n[{header}]")
         print(f"  install: {o.install_decision} in "
               f"{o.install_duration_seconds:.1f}s "
-              f"(already_existed={o.install_already_existed})")
+              f"(already_existed={o.install_already_existed}, "
+              f"model_exists={exists_label})")
 
         if o.error:
             print(f"  READINESS FAILED: {o.error}")
@@ -525,6 +589,17 @@ def render_json_dump(outcomes: list[BenchOutcome], cfg: BenchConfig,
     into a JSON document. Used both as the email attachment and as the
     record-keeping artifact when ``output_dir`` is set in a future
     iteration.
+
+    The wire format mirrors :class:`BenchOutcome` field-for-field via
+    ``dataclasses.asdict``. Two fields worth flagging for consumers:
+
+      * ``install_status`` — the raw parsed JSON payload from
+        ``olares-cli market install --watch -o json`` (or ``null`` on
+        the REUSED path / when no JSON was emitted).
+      * ``model_exists`` — tri-state boolean (``true`` / ``false`` /
+        ``null``) computed via :func:`derive_model_exists`. ``false``
+        is the conclusive signal that the app name does not exist in
+        any olares-market source; ``null`` means we couldn't decide.
     """
     return json.dumps({
         "stamp": stamp,
@@ -552,6 +627,7 @@ th,td {border:1px solid #ddd; padding:4px 8px; text-align:right;
 th {background:#f6f6f6;}
 td.prompt {text-align:left; max-width:280px; word-break:break-word;}
 td.err {text-align:left; background:#fdecea; color:#a50e0e;}
+td.warn-cell {background:#fef7e0; color:#a05a00;}
 .error-banner {background:#fdecea; color:#a50e0e; border:1px solid #fbb;
                padding:8px 12px; border-radius:4px; margin:6px 0;}
 """
@@ -560,6 +636,35 @@ td.err {text-align:left; background:#fdecea; color:#a50e0e;}
 def _h(s: object) -> str:
     """Shorthand for HTML-escape."""
     return html_lib.escape(str(s), quote=True)
+
+
+def _model_exists_label(value: bool | None) -> str:
+    """Human-readable rendering of the tri-state ``model_exists`` flag.
+
+    Used by stdout summary, HTML body, and (indirectly) JSON dump
+    enrichment so all three surfaces agree on the wording.
+    """
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "unknown"
+
+
+def _model_exists_cell(value: bool | None) -> str:
+    """Coloured ``<td>`` for the per-target overview table.
+
+    Mirrors the existing ``tag-ok / tag-warn / tag-err`` palette so
+    the email body is consistent regardless of how the value got
+    rendered. False (app name not in market) is emphasised in red
+    because it's the most actionable failure mode.
+    """
+    label = _model_exists_label(value)
+    if value is True:
+        return f"<td>{label}</td>"
+    if value is False:
+        return f"<td class='err'>{label}</td>"
+    return f"<td class='warn-cell'>{label}</td>"
 
 
 def _agg(values: list[float]) -> str:
@@ -580,6 +685,7 @@ def render_email_html(outcomes: list[BenchOutcome], cfg: BenchConfig,
                            if o.install_ok and o.error)
     prompt_failed = sum(1 for o in outcomes
                         if o.reached_prompts and o.any_prompt_failed)
+    missing_models = sum(1 for o in outcomes if o.model_exists is False)
 
     parts: list[str] = []
     parts.append("<!doctype html><html><head>"
@@ -592,7 +698,47 @@ def render_email_html(outcomes: list[BenchOutcome], cfg: BenchConfig,
                  f"{total} target(s) · {fully_ok} fully OK · "
                  f"{install_failed} install fail · "
                  f"{readiness_failed} readiness fail · "
-                 f"{prompt_failed} with prompt errors</p>")
+                 f"{prompt_failed} with prompt errors · "
+                 f"{missing_models} app name(s) not found</p>")
+
+    # Per-target overview table -- gives a single-glance answer to
+    # "which apps installed cleanly and which ones don't even exist
+    # in the market?". The same row data is repeated in the
+    # per-target sections below; readers who only care about install
+    # status can stop after this table.
+    parts.append("<h2>Per-target overview</h2>")
+    parts.append("<table><thead><tr>"
+                 "<th>app</th><th>model</th>"
+                 "<th>model_exists</th>"
+                 "<th>install</th><th>install_dur</th>"
+                 "<th>readiness</th>"
+                 "<th>rounds (ok/total)</th>"
+                 "</tr></thead><tbody>")
+    for o in outcomes:
+        exists_tag = _model_exists_cell(o.model_exists)
+        if o.install_error:
+            install_cell = ("<td class='err'>failed</td>"
+                            f"<td>{o.install_duration_seconds:.1f}s</td>")
+        else:
+            install_cell = (f"<td>{_h(o.install_decision or '—')}</td>"
+                            f"<td>{o.install_duration_seconds:.1f}s</td>")
+        if o.install_error:
+            readiness_cell = "<td>—</td>"
+        elif o.error:
+            readiness_cell = "<td class='err'>failed</td>"
+        else:
+            readiness_cell = "<td>ready</td>"
+        oks = sum(1 for q in o.rounds if q.ok)
+        rounds_cell = f"<td>{oks}/{len(o.rounds)}</td>"
+        parts.append(
+            f"<tr>"
+            f"<td class='prompt'>{_h(o.target.app_name)}</td>"
+            f"<td class='prompt'>{_h(o.target.model_name)}</td>"
+            f"{exists_tag}{install_cell}{readiness_cell}{rounds_cell}"
+            f"</tr>"
+        )
+    parts.append("</tbody></table>")
+
     parts.append("<p class='meta'>prompts: <ol>")
     for p in cfg.prompts:
         parts.append(f"<li>{_h(p)}</li>")
@@ -605,6 +751,20 @@ def render_email_html(outcomes: list[BenchOutcome], cfg: BenchConfig,
 
         # Status tag row.
         tags: list[str] = []
+        # model_exists tag is shown FIRST and on every target — even on
+        # install-failure rows — because "does this app name even
+        # resolve?" is usually the first thing operators check when a
+        # row goes red.
+        exists_label = _model_exists_label(o.model_exists)
+        if o.model_exists is True:
+            tags.append(f"<span class='tag tag-ok'>model_exists="
+                        f"{_h(exists_label)}</span>")
+        elif o.model_exists is False:
+            tags.append(f"<span class='tag tag-err'>model_exists="
+                        f"{_h(exists_label)}</span>")
+        else:
+            tags.append(f"<span class='tag tag-warn'>model_exists="
+                        f"{_h(exists_label)}</span>")
         if o.install_error:
             tags.append("<span class='tag tag-err'>install failed</span>")
         else:
@@ -688,10 +848,45 @@ def render_email_html(outcomes: list[BenchOutcome], cfg: BenchConfig,
 # ---------------------------------------------------------------------------
 
 
+# Placeholders honoured by mailer._render_subject. Listed here (and
+# not imported) so the safety-net check below can stay a pure-string
+# operation independent of the mailer module's internals.
+_SUBJECT_PLACEHOLDERS: tuple[str, ...] = ("{date}", "{datetime}", "{stamp}")
+
+
+def _ensure_subject_has_timestamp(email: EmailConfig) -> EmailConfig:
+    """Auto-append ``{stamp}`` when the configured subject contains no
+    timestamp placeholder.
+
+    ``mailer._render_subject`` already substitutes ``{date}`` /
+    ``{datetime}`` / ``{stamp}`` whenever they appear in the subject.
+    This harness is typically re-run repeatedly while iterating on a
+    chart / prompt — without a placeholder every email lands under
+    the same Gmail thread and becomes hard to compare. Appending
+    ``{stamp}`` is a no-op for configs that already opted in (any
+    placeholder present → return as-is) and is intentionally scoped
+    to this script; the main ``llm_bench.py`` pipeline keeps its
+    "subject is verbatim" contract.
+    """
+    subject = email.subject or ""
+    if any(p in subject for p in _SUBJECT_PLACEHOLDERS):
+        return email
+    new_subject = f"{subject} {{stamp}}".strip() if subject else "{stamp}"
+    log.info("subject had no timestamp placeholder — auto-appending "
+             "{stamp}; effective template: %r", new_subject)
+    return dataclasses.replace(email, subject=new_subject)
+
+
 def send_summary_email(cfg: BenchConfig, outcomes: list[BenchOutcome],
                        *, stamp: str) -> None:
     """Ship the HTML body + JSON attachment via SMTP. No-op when
     ``cfg.email`` is None (script just printed the summary).
+
+    Subjects support ``{date}`` / ``{datetime}`` / ``{stamp}``
+    placeholders via :func:`llm_bench.data.mailer._render_subject`.
+    If the configured subject contains none of them this function
+    auto-appends ``{stamp}`` so every run lands under a distinct
+    subject (see :func:`_ensure_subject_has_timestamp`).
 
     Wrapped so a SMTP failure here cannot lose the stdout / JSON
     artifacts that the operator might want to grep later.
@@ -701,9 +896,10 @@ def send_summary_email(cfg: BenchConfig, outcomes: list[BenchOutcome],
         return
     html = render_email_html(outcomes, cfg, stamp=stamp)
     json_dump = render_json_dump(outcomes, cfg, stamp=stamp)
+    email = _ensure_subject_has_timestamp(cfg.email)
     try:
         send_email(
-            cfg.email, html, json_dump,
+            email, html, json_dump,
             stamp=stamp,
             json_filename=f"ollama_multi_bench_{stamp}.json",
         )
@@ -763,16 +959,24 @@ def main() -> int:
     # row.
     outcomes: list[BenchOutcome] = []
     for inst in installs:
+        model_exists = derive_model_exists(
+            install_status=inst.install_status,
+            install_error=inst.error,
+            install_decision=inst.decision,
+        )
         outcome = BenchOutcome(
             target=inst.target,
             install_decision=inst.decision,
             install_duration_seconds=inst.duration_seconds,
             install_already_existed=inst.already_existed,
+            install_status=inst.install_status,
             install_error=inst.error,
+            model_exists=model_exists,
         )
         if inst.error:
-            log.warning("[bench] skipping %s prompts: install failed",
-                        inst.target.app_name)
+            log.warning("[bench] skipping %s prompts: install failed "
+                        "(model_exists=%s)",
+                        inst.target.app_name, model_exists)
             outcomes.append(outcome)
             continue
         prepare_outcome(outcome, cfg)

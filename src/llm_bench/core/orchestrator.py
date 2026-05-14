@@ -117,7 +117,10 @@ def _step_install(ctx: BenchmarkContext) -> None:
     converts the exception to ``ctx.result.error``.
     """
     t = time.perf_counter()
-    already_existed, decision = ensure_installed(
+    # The third element (parsed `-o json` payload) is consumed by the
+    # standalone ollama_multi_bench harness, not the main pipeline —
+    # ignore it here to keep ModelResult's wire format stable.
+    already_existed, decision, _install_status = ensure_installed(
         ctx.app,
         install_minutes=ctx.opts.install_minutes,
         uninstall_minutes=ctx.opts.uninstall_minutes,

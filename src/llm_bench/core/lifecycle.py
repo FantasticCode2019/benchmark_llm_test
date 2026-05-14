@@ -38,13 +38,96 @@ ROLLED_BACK_STATES = {
 }
 
 
+class MarketInstallFailed(RuntimeError):
+    """Raised when ``olares-cli market install --watch`` exits non-zero.
+
+    Carries the parsed ``-o json`` payload (when the CLI emitted one)
+    so callers can distinguish a real "app name doesn't exist"
+    response — ``status == "failed"`` — from a transport / timeout
+    error where no JSON ever arrived. The ``ollama_multi_bench``
+    harness uses this distinction to drive its per-target
+    ``model_exists`` column in the email / JSON report.
+    """
+
+    def __init__(self, app: str, *, returncode: int,
+                 status: dict | None, message: str) -> None:
+        super().__init__(message)
+        self.app = app
+        self.returncode = returncode
+        # Either a dict like ``{"status": "failed", "finalState": ...,
+        # "finalOpType": ...}`` or None when the CLI errored before
+        # printing JSON (timeout, panic, etc.).
+        self.status = status
+
+
+def _parse_install_status(raw: str | None) -> dict | None:
+    """Decode the JSON object emitted by ``market install -o json``.
+
+    Returns None on empty / unparseable stdout — callers treat that as
+    "no machine-readable verdict, fall back to other signals". When
+    the CLI emits a single-element list we unwrap it so callers don't
+    have to care which shape arrived.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning("could not decode market install JSON: %s",
+                    raw[:200])
+        return None
+    if isinstance(data, list):
+        data = data[0] if data else None
+    return data if isinstance(data, dict) else None
+
+
 def market_install(app: str, *, watch_minutes: int,
-                   envs: list | None = None) -> None:
-    cmd = [cli(), "market", "install", app,
+                   envs: list | None = None) -> dict | None:
+    """Run ``olares-cli market install <app> --watch -o json``.
+
+    Returns:
+        The parsed JSON status dict on success — typically
+        ``{"status": "success", "finalState": "running",
+        "finalOpType": "install"}``. Returns ``None`` only when the
+        CLI exited 0 but emitted no JSON (older CLI builds or unusual
+        installs); a return of ``None`` still means the install
+        succeeded as far as the CLI is concerned.
+
+    Raises:
+        MarketInstallFailed: when the CLI exits non-zero. The
+            exception carries the parsed JSON (when available) so the
+            caller can tell ``status == "failed"`` (app name unknown,
+            install conclusively did NOT happen) from a transport
+            error where no JSON ever arrived.
+        subprocess.TimeoutExpired: when the install ran longer than
+            ``watch_minutes`` (the CLI was killed before producing
+            any output to parse).
+    """
+    cmd = [cli(), "market", "install", app, "-o", "json",
            "--watch", "--watch-timeout", f"{watch_minutes}m"]
     for kv in envs or []:
         cmd.extend(["--env", kv])
-    run(cmd, timeout=watch_minutes * 60 + 60)
+    proc = run(cmd, timeout=watch_minutes * 60 + 60,
+               capture=True, check=False)
+    status = _parse_install_status(proc.stdout)
+    if proc.returncode != 0:
+        # Surface a concise reason; include the parsed status so the
+        # log line is useful even without the exception chain.
+        reason: str
+        if isinstance(status, dict):
+            reason = (f"status={status.get('status')!r} "
+                      f"finalState={status.get('finalState')!r} "
+                      f"finalOpType={status.get('finalOpType')!r}")
+        else:
+            reason = (proc.stderr or proc.stdout or "")[:200].strip() \
+                     or "no output"
+        message = (f"market install {app} exited "
+                   f"{proc.returncode}: {reason}")
+        log.warning("%s", message)
+        raise MarketInstallFailed(app, returncode=proc.returncode,
+                                  status=status, message=message)
+    return status
 
 
 def market_uninstall(app: str, *, watch_minutes: int = 30,
@@ -98,26 +181,36 @@ def market_status_watch(app: str, *, watch_minutes: int) -> None:
 def ensure_installed(app: str, *, install_minutes: int,
                      uninstall_minutes: int, install_envs: list[str],
                      delete_data: bool, skip_if_running: bool,
-                     ) -> tuple[bool, InstallDecision]:
+                     ) -> tuple[bool, InstallDecision, dict | None]:
     """Make sure the app is ``running`` before benchmarking.
 
-    Returns ``(already_existed, decision)`` where ``decision`` is a
-    :class:`InstallDecision` enum member. The orchestrator stores it
-    directly on ``ModelResult.install_decision``; the JSON serializer
-    emits its string value so the wire format is unchanged.
+    Returns ``(already_existed, decision, install_status)``:
+
+      * ``decision`` is a :class:`InstallDecision` enum member; the
+        orchestrator stores it directly on
+        ``ModelResult.install_decision`` and the JSON serializer
+        emits its string value so the wire format is unchanged.
+      * ``install_status`` is the parsed ``-o json`` payload from the
+        most recent ``market install`` call — typically
+        ``{"status": "success", "finalState": "running",
+        "finalOpType": "install"}``. It is ``None`` on the REUSED
+        path (no install command was issued) and on success paths
+        where the CLI emitted no JSON. Downstream consumers that
+        only need the decision can ignore it.
     """
     row = get_app_state(app)
     if row is None:
         log.info("%s not installed, installing...", app)
-        market_install(app, watch_minutes=install_minutes, envs=install_envs)
-        return (False, InstallDecision.FRESH)
+        status = market_install(
+            app, watch_minutes=install_minutes, envs=install_envs)
+        return (False, InstallDecision.FRESH, status)
 
     state = (row.get("state") or "").strip()
     log.info("%s pre-existing state=%r op=%r", app, state, row.get("opType"))
 
     if state in RUNNING_STATES and skip_if_running:
         log.info("%s already running -> skipping install", app)
-        return (True, InstallDecision.REUSED)
+        return (True, InstallDecision.REUSED, None)
 
     if state in PROGRESSING_STATES:
         log.info("%s mid-lifecycle (%s); waiting for terminal state...",
@@ -127,7 +220,7 @@ def ensure_installed(app: str, *, install_minutes: int,
         new_state = (row or {}).get("state", "")
         if new_state in RUNNING_STATES:
             log.info("%s converged to running after watch", app)
-            return (True, InstallDecision.REUSED)
+            return (True, InstallDecision.REUSED, None)
         log.warning("%s landed in %r after watch; reinstalling", app, new_state)
         state = new_state
 
@@ -135,8 +228,9 @@ def ensure_installed(app: str, *, install_minutes: int,
         log.info("%s in rolled-back state %r -> reinstalling directly "
                  "(no uninstall needed: helm release already gone)",
                  app, state)
-        market_install(app, watch_minutes=install_minutes, envs=install_envs)
-        return (False, InstallDecision.RECOVERED)
+        status = market_install(
+            app, watch_minutes=install_minutes, envs=install_envs)
+        return (False, InstallDecision.RECOVERED, status)
 
     log.warning("%s in non-running state (%s); uninstall + reinstall", app, state)
     try:
@@ -144,8 +238,9 @@ def ensure_installed(app: str, *, install_minutes: int,
                          delete_data=delete_data)
     except Exception as exc:  # pre-install uninstall is best-effort
         log.warning("pre-install uninstall failed (continuing): %s", exc)
-    market_install(app, watch_minutes=install_minutes, envs=install_envs)
-    return (False, InstallDecision.RECOVERED)
+    status = market_install(
+        app, watch_minutes=install_minutes, envs=install_envs)
+    return (False, InstallDecision.RECOVERED, status)
 
 
 # Olares chart names are always lowercase alphanumeric (see

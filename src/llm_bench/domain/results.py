@@ -22,8 +22,22 @@ from llm_bench.domain.enums import ApiType, InstallDecision
 class QuestionResult:
     """Per-prompt timing record. Field semantics differ between backends:
 
-      ollama (/api/generate, stream=false)
-        - ttft_seconds        : load + prompt_eval (PRECISE; from server)
+      ollama (/api/generate, stream=true — see core/benchmark/ollama.py)
+        - ttft_seconds        : client-observed wall-clock to the FIRST
+                                non-empty visible response chunk
+                                (whitespace-only chunks filtered).
+                                Always measured.
+        - thinking_ttft_seconds: client-observed wall-clock to the FIRST
+                                non-empty thinking chunk; populated
+                                only when the runtime probe said the
+                                model supports thinking AND the model
+                                actually emitted a thinking chunk.
+        - load_seconds /
+          prompt_eval_seconds : server-side aggregate timings from the
+                                final done:true chunk. Diagnostic
+                                only — NOT used as TTFT (would
+                                understate user-visible TTFT for
+                                thinking models).
         - eval_seconds        : decode duration (server)
         - tps                 : decode tokens / decode seconds (server)
         - total_server_seconds: total_duration (server)
@@ -40,22 +54,17 @@ class QuestionResult:
           are populated from `usage` and `timings` blocks
 
     Thinking (DeepSeek-R1 / Qwen3 / GPT-OSS / o1-style):
-      - `ttft_seconds` is the **non-streaming aggregate approximation**
-        of "model load + prefill" time — i.e. `load_duration +
-        prompt_eval_duration` read from the server's stats on the
-        final chunk. It does NOT depend on whether the model emitted
-        thinking; it's a server-side, deterministic number that's
-        cheap to compute and useful as a baseline.
-      - `thinking_ttft_seconds` is the **client-side wall-clock TTFT
-        for the reasoning phase**, computed as
-        `first_thinking_chunk_arrival + load_duration` for ollama
-        (or `first_reasoning_chunk_arrival` for vLLM). The
-        `+ load_duration` correction explicitly folds in the model
-        load time so the metric reflects cold-start behaviour even on
-        a hot daemon that pre-warmed the model. Populated only when
-        the runtime probe (ollama) or config (vLLM) reported thinking
-        support AND the model actually emitted a thinking chunk. Left
-        at 0.0 otherwise (rendered as `—` in the email).
+      - For ollama, both `ttft_seconds` and `thinking_ttft_seconds`
+        share the same `time.perf_counter()` epoch (right before
+        urlopen) so they're directly comparable. For a model that
+        thinks-then-answers the expected order is
+        `thinking_ttft_seconds < ttft_seconds`.
+      - For vLLM, `thinking_ttft_seconds` is the wall-clock to the
+        first reasoning chunk (`delta.reasoning` /
+        `delta.reasoning_content`); `ttft_seconds` is the existing
+        max_tokens=1 round-trip approximation. They're NOT in the same
+        coordinate system — kept that way to preserve the openai
+        backend's existing wire format.
       - `has_thinking`: for ollama, ECHOED FROM the runtime
         `ollama_supports_thinking` probe; for openai/vLLM, ECHOED FROM
         `spec.thinking` config. Set on every prompt of the run so the

@@ -43,8 +43,11 @@ def render_html(results: list) -> str:
 
     rows: list = []
     for idx, r in enumerate(results):
+        # `ok_q` still drives the Status badge below even though the
+        # OK / N column itself was removed from the email body to keep
+        # the table compact. Per-prompt counts are preserved in the
+        # JSON / Excel attachments.
         ok_q = sum(1 for q in r.questions if q.ok)
-        total_q = len(r.questions)
         run_ok = r.error is None and ok_q > 0
         bg = "#ffffff" if idx % 2 == 0 else "#fafbfc"
 
@@ -93,19 +96,6 @@ def render_html(results: list) -> str:
         ttft_think_cell = (f"{ttft_think_avg:.2f}" if ttft_think_avg
                            else '<span style="color:#bbb">—</span>')
 
-        # "Has Think" column: binary Yes / No, echoed straight from
-        # `spec.thinking` in the config (no runtime detection).
-        if r.has_thinking_label() == "Yes":
-            ht_cell = ('<span style="display:inline-block;padding:1px 8px;'
-                       'border-radius:10px;background:#e6f7ee;color:#0a7d48;'
-                       'font-size:11px;font-weight:600;letter-spacing:.02em">'
-                       'Yes</span>')
-        else:
-            ht_cell = ('<span style="display:inline-block;padding:1px 8px;'
-                       'border-radius:10px;background:#f1f3f5;color:#6b7280;'
-                       'font-size:11px;font-weight:600;letter-spacing:.02em">'
-                       'No</span>')
-
         rows.append(
             f'<tr style="background:{bg};">'
             f'<td style="{cell_l}">'
@@ -120,9 +110,6 @@ def render_html(results: list) -> str:
             f'border-radius:3px;font-size:12px;color:#1a1a1a;'
             f'font-family:SFMono-Regular,Consolas,Menlo,monospace">'
             f'{html_escape(r.model)}</code></td>'
-            f'<td style="{cell_c};color:#666">{html_escape(r.api_type)}</td>'
-            f'<td style="{cell_c}">{ok_q}/{total_q}</td>'
-            f'<td style="{cell_c}">{ht_cell}</td>'
             f'<td style="{cell_r}">{ttft_think_cell}</td>'
             f'<td style="{cell_r}">{r.avg("ttft_seconds"):.2f}</td>'
             f'<td style="{cell_r};font-weight:600;color:#0b5fff">'
@@ -165,9 +152,6 @@ def render_html(results: list) -> str:
         'font-size:13px"><thead><tr>'
         f'<th style="{th_l}">App</th>'
         f'<th style="{th_l}">Model</th>'
-        f'<th style="{th_c}">API</th>'
-        f'<th style="{th_c}">OK / N</th>'
-        f'<th style="{th_c}">Has Think</th>'
         f'<th style="{th_r}">Think TTFT (s)</th>'
         f'<th style="{th_r}">TTFT (s)</th>'
         f'<th style="{th_r}">TPS</th>'
@@ -180,15 +164,11 @@ def render_html(results: list) -> str:
         # footer legend — compact, single line wherever possible
         '<p style="margin:14px 2px 0;color:#888;font-size:11.5px;'
         'line-height:1.55">'
-        '<b>Has Think</b> = does the model expose a separate '
-        'reasoning/thinking phase? Echoed from <code>spec.thinking</code> '
-        'in the config (set per model — true for DeepSeek-R1 / Qwen3 / '
-        'GPT-OSS / o1-style, false otherwise) &middot; '
         '<b>Think TTFT</b> = time to the model\'s FIRST '
         'reasoning/thinking token (Ollama <code>message.thinking</code>, '
         'vLLM <code>delta.reasoning</code>); empty '
-        '(<span style="color:#bbb">—</span>) when <b>Has Think</b> is '
-        '<b>No</b> or the streaming probe failed &middot; '
+        '(<span style="color:#bbb">—</span>) when the model has no '
+        'thinking phase or the streaming probe failed &middot; '
         '<b>TTFT</b> = time to the first ANSWER token (after thinking, '
         'if any) &middot; '
         '<b>TPS</b> = generated tokens per second &middot; '
@@ -203,7 +183,8 @@ def render_html(results: list) -> str:
         '<code style="background:#f3f4f6;padding:0 4px;border-radius:3px">'
         'timings.predicted_per_second</code> when present, else '
         'completion_tokens / wall. '
-        'Per-prompt records, errors, and notes are in the attached JSON.'
+        'API type, per-prompt counts, and the <b>Has Think</b> flag '
+        'are preserved in the JSON / Excel attachments.'
         '</p>'
         '</div>'
     )
