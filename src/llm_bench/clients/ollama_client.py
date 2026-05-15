@@ -1,12 +1,16 @@
 """Ollama HTTP client.
 
-Wraps the four Ollama endpoints we care about:
+Wraps the Ollama HTTP endpoints we care about:
 
 * ``GET  /api/progress``   bundle download snapshot (readiness probe)
-* ``GET  /api/tags``       installed model catalogue
+* ``GET  /api/tags``       installed model catalogue (ollama-native)
 * ``GET  /api/ps``         currently-loaded model(s) — fetched implicitly
                            by the descriptor helpers
 * ``POST /api/show``       per-model capability + size + context data
+* ``GET  /v1/models``      OpenAI-compatible model listing; used by
+                           :func:`ollama_discover_model_id` to recover
+                           the daemon's canonical model id when the
+                           operator-supplied name is unreliable
 
 Public functions are stable; their `_ollama_*` collaborators are exported
 under leading-underscore names because tests pin individual branches of
@@ -347,32 +351,95 @@ def ollama_describe_model(url: str, *,
     return result
 
 
-def ollama_supports_thinking(url: str, *,
+def ollama_discover_model_id(url: str, *,
+                              timeout: int = HTTP_DEFAULT_TIMEOUT_SECONDS,
+                              ) -> str | None:
+    """Return the first model id reported by Ollama's OpenAI-compatible
+    ``/v1/models`` endpoint, or ``None`` when nothing usable came back.
+
+    Curl equivalent::
+
+        curl -s $HOST/v1/models | jq -r '.data[0].id // empty'
+
+    Response shape::
+
+        {"object": "list",
+         "data": [{"id": "gemma4:26b-a4b-it-ud-q4_K_XL",
+                   "object": "model", "owned_by": "library",
+                   "created": 1778761066}, ...]}
+
+    Why this exists: operators occasionally annotate the configured
+    model name with extra metadata (``"gemma4:26b-a4b-it-ud-q4_K_XL
+    (Unsloth GGUF)"`` and friends). The daemon's ``/api/show`` /
+    ``/api/generate`` then 4xx because the bracketed suffix is part
+    of the string. Bouncing through ``/v1/models`` recovers the
+    **daemon-authoritative** id so downstream probes / prompts hit a
+    name the server actually accepts. The helper picks
+    ``data[0].id``; pin a specific entry upstream if you care which
+    one when several are installed.
+
+    Best-effort like the other helpers: transport / non-2xx / bad
+    JSON / wrong-shape responses all collapse to ``None``.
+    """
+    status, body = http_get_status(
+        f"{url.rstrip('/')}/v1/models", timeout=timeout)
+    if not (200 <= status < 300):
+        log.debug("ollama /v1/models returned HTTP %d: %s",
+                  status, (body or "")[:200])
+        return None
+    try:
+        data = json.loads(body or "{}")
+    except json.JSONDecodeError:
+        log.warning("ollama /v1/models body not JSON: %s",
+                    (body or "")[:200])
+        return None
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        mid = entry.get("id")
+        if isinstance(mid, str) and mid:
+            return mid
+    return None
+
+
+def ollama_supports_thinking(url: str, model: str, *,
                              timeout: int = HTTP_DEFAULT_TIMEOUT_SECONDS,
                              ) -> bool:
-    """Return True iff the Ollama daemon at `url` exposes a model whose
-    /api/show declares the `thinking` capability.
+    """Return True iff Ollama's ``/api/show`` for the **caller-supplied**
+    ``model`` lists ``thinking`` in its capabilities.
 
-    Python equivalent of:
-        HOST=<url>
-        MODEL=$(curl -s $HOST/api/ps   | jq -r '.models[0].name // empty')
-        MODEL=${MODEL:-$(curl -s $HOST/api/tags | jq -r '.models[0].name // empty')}
+    Python equivalent of (note the model is NOT auto-detected)::
+
         curl -s $HOST/api/show -d "{\\"model\\":\\"$MODEL\\"}" \\
             | jq '.capabilities | index("thinking") != null'
 
-    Any failure along the way (daemon unreachable, no models at all,
-    /api/show 4xx, body without a `capabilities` array, ...) collapses
-    to False — callers asked for a bool, not an exception, and "we
-    couldn't prove it supports thinking" is the safe default.
+    Determinism note: an earlier version of this helper auto-picked
+    the model name from ``/api/ps[0].name`` (currently loaded) with a
+    fallback to ``/api/tags[0].name`` (installed on disk). That
+    behaviour silently flipped True/False between runs whenever the
+    daemon hosted more than one model — ``/api/ps`` is empty before
+    the first prompt loads anything into VRAM (so we hit tags),
+    while subsequent invocations with ``skip_install_if_running`` see
+    a warm VRAM and pick from ``/api/ps`` instead. The two lists are
+    also unordered, so even within one source the ``[0]`` slot is
+    implementation-dependent. Always pass the configured model name
+    so the answer reflects THAT model, not whichever the daemon
+    happens to expose first. When the operator-supplied name is
+    known to be unreliable (annotated with ``(Unsloth GGUF)`` etc.),
+    bounce it through :func:`ollama_discover_model_id` first.
+
+    Any failure (daemon unreachable, ``/api/show`` 4xx for a model
+    name the daemon doesn't know, body without a ``capabilities``
+    array, ...) collapses to False — callers asked for a bool, not
+    an exception, and "we couldn't prove it supports thinking" is
+    the safe default.
     """
-    base = url.rstrip("/")
-    model_name = _ollama_first_name(
-        _ollama_get_models_list(base, "/api/ps", timeout=timeout),
-        _ollama_get_models_list(base, "/api/tags", timeout=timeout),
-    )
-    if not model_name:
+    if not model:
         return False
-    show = _ollama_show(base, model_name, timeout=timeout)
+    show = _ollama_show(url.rstrip("/"), model, timeout=timeout)
     caps = show.get("capabilities") if isinstance(show, dict) else None
     if not isinstance(caps, list):
         return False
@@ -381,6 +448,7 @@ def ollama_supports_thinking(url: str, *,
 
 __all__ = [
     "ollama_describe_model",
+    "ollama_discover_model_id",
     "ollama_model_names",
     "ollama_progress",
     "ollama_supports_thinking",

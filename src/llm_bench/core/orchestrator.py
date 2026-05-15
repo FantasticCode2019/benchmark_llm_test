@@ -221,8 +221,13 @@ def _step_probe_ollama_thinking(ctx: BenchmarkContext) -> None:
     if ctx.opts.api_type is not ApiType.OLLAMA:
         return
     try:
+        # Pin the probe to the configured model name. The helper used
+        # to auto-pick from /api/ps + /api/tags which flipped
+        # True/False between runs whenever the daemon hosted more
+        # than one model — see `ollama_supports_thinking` docstring.
         supports = ollama_supports_thinking(
-            ctx.entrance_url, timeout=ctx.opts.request_timeout)
+            ctx.entrance_url, ctx.spec.model_name,
+            timeout=ctx.opts.request_timeout)
     except Exception as exc:
         log.warning("%s: ollama_supports_thinking probe failed: %s",
                     ctx.app, exc)

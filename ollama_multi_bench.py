@@ -64,7 +64,10 @@ _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from llm_bench.clients.ollama_client import ollama_supports_thinking  # noqa: E402
+from llm_bench.clients.ollama_client import (  # noqa: E402
+    ollama_discover_model_id,
+    ollama_supports_thinking,
+)
 from llm_bench.constants import DEFAULT_OLARES_CLI, LOG_NAMESPACE  # noqa: E402
 from llm_bench.core.benchmark.ollama import benchmark_prompt_ollama  # noqa: E402
 from llm_bench.core.entrance import ensure_entrance_public, find_entrance  # noqa: E402
@@ -327,6 +330,16 @@ class BenchOutcome:
     the tri-state convenience flag derived from it via
     :func:`derive_model_exists`. Both are reported in the JSON
     attachment, HTML email body, and stdout summary.
+
+    ``effective_model_name`` is the canonical id reported by
+    ``GET /v1/models`` after the daemon comes up. We prefer it over
+    ``target.model_name`` for downstream ``/api/show`` and
+    ``/api/generate`` calls because operators sometimes annotate the
+    configured name with metadata (e.g. ``"gemma4:26b-... (Unsloth
+    GGUF)"``) that the daemon doesn't accept verbatim. ``None`` means
+    we couldn't discover anything — callers fall back to
+    ``target.model_name`` (which may itself 4xx; the failure
+    propagates through ``QuestionResult.error``).
     """
     target: TargetModel
     install_decision: str = ""
@@ -336,6 +349,7 @@ class BenchOutcome:
     install_error: str | None = None
     model_exists: bool | None = None
     entrance_url: str = ""
+    effective_model_name: str | None = None
     supports_thinking: bool | None = None
     rounds: list[QuestionResult] = field(default_factory=list)
     error: str | None = None
@@ -357,6 +371,16 @@ class BenchOutcome:
         return (self.reached_prompts
                 and bool(self.rounds)
                 and not self.any_prompt_failed)
+
+    @property
+    def api_model_name(self) -> str:
+        """Model id to send on ``/api/*`` calls. Falls back to the
+        operator-supplied ``model_name`` when ``/v1/models``
+        discovery yielded nothing — the 4xx that follows will land
+        on ``QuestionResult.error`` so the failure is visible in the
+        summary instead of silently hiding upstream.
+        """
+        return self.effective_model_name or self.target.model_name
 
 
 # ---------------------------------------------------------------------------
@@ -439,9 +463,18 @@ def install_sequential(cfg: BenchConfig) -> list[InstallOutcome]:
 def prepare_outcome(outcome: BenchOutcome,
                     cfg: BenchConfig) -> BenchOutcome:
     """Resolve the entrance, flip to public, wait for the model to load,
-    then snapshot the runtime ``thinking`` capability. Does NOT send
-    any benchmark prompts — those are driven from the interleaved
-    prompt loop in :func:`main`.
+    discover the canonical model id via ``/v1/models``, then snapshot
+    the runtime ``thinking`` capability. Does NOT send any benchmark
+    prompts — those are driven from the interleaved prompt loop in
+    :func:`main`.
+
+    The ``/v1/models`` discovery is the key step that lets this
+    harness tolerate operator-annotated model names (``"gemma4:...
+    (Unsloth GGUF)"``) — the daemon-authoritative id stored on
+    ``outcome.effective_model_name`` is what's actually sent to
+    ``/api/show`` and ``/api/generate``. A mismatch between the
+    configured name and the discovered id is logged at WARN so it's
+    obvious in the log archive.
 
     On any failure ``outcome.error`` is set and the caller skips this
     outcome from the prompt loop (its ``rounds`` list stays empty so
@@ -465,11 +498,41 @@ def prepare_outcome(outcome: BenchOutcome,
         outcome.error = f"readiness: {exc}"
         return outcome
 
+    # `/v1/models` discovery — recover the canonical id even when the
+    # configured `target.model_name` has trailing annotations the
+    # ollama daemon won't accept (``"... (Unsloth GGUF)"`` etc.).
+    try:
+        discovered = ollama_discover_model_id(
+            outcome.entrance_url, timeout=cfg.request_timeout_seconds)
+    except Exception as exc:
+        log.warning("[discover] %s /v1/models lookup raised: %s",
+                    target.app_name, exc)
+        discovered = None
+    if discovered:
+        outcome.effective_model_name = discovered
+        if discovered != target.model_name:
+            log.warning("[discover] %s: configured model_name %r "
+                        "differs from /v1/models id %r — using the "
+                        "daemon's id for /api/show & /api/generate",
+                        target.app_name, target.model_name, discovered)
+        else:
+            log.info("[discover] %s: /v1/models confirms id %r",
+                     target.app_name, discovered)
+    else:
+        log.warning("[discover] %s: /v1/models returned no usable id; "
+                    "falling back to configured %r (may 4xx)",
+                    target.app_name, target.model_name)
+
+    # supports_thinking probe — pin to the effective id so the
+    # answer reflects THIS model (see ollama_supports_thinking
+    # docstring for the determinism reasoning).
+    effective = outcome.api_model_name
     try:
         outcome.supports_thinking = ollama_supports_thinking(
-            outcome.entrance_url, timeout=cfg.request_timeout_seconds)
-        log.info("[probe] %s supports_thinking=%s",
-                 target.app_name, outcome.supports_thinking)
+            outcome.entrance_url, effective,
+            timeout=cfg.request_timeout_seconds)
+        log.info("[probe] %s (%s) supports_thinking=%s",
+                 target.app_name, effective, outcome.supports_thinking)
     except Exception as exc:
         log.warning("[probe] %s supports_thinking failed: %s",
                     target.app_name, exc)
@@ -494,10 +557,16 @@ def run_prompt_on(outcome: BenchOutcome, prompt: str, *,
     target = outcome.target
     thinking = bool(outcome.supports_thinking)
     snippet = prompt[:60].replace("\n", " ")
-    log.info("[prompt %d/%d] %s <- %s",
-             round_index, total_rounds, target.app_name, snippet)
+    # Use the /v1/models-resolved id so the request can't 4xx on
+    # annotated config names. `outcome.api_model_name` returns the
+    # discovered id when available, falling back to the configured
+    # name otherwise — see BenchOutcome.api_model_name.
+    model_for_api = outcome.api_model_name
+    log.info("[prompt %d/%d] %s (%s) <- %s",
+             round_index, total_rounds, target.app_name,
+             model_for_api, snippet)
     qr = benchmark_prompt_ollama(
-        outcome.entrance_url, target.model_name, prompt,
+        outcome.entrance_url, model_for_api, prompt,
         request_timeout=cfg.request_timeout_seconds,
         thinking=thinking,
     )
@@ -551,6 +620,15 @@ def print_summary(outcomes: list[BenchOutcome]) -> None:
         ttfts = [q.ttft_seconds for q in oks if q.ttft_seconds]
         thinking_ttfts = [q.thinking_ttft_seconds for q in oks
                           if q.thinking_ttft_seconds]
+        if o.effective_model_name and \
+                o.effective_model_name != o.target.model_name:
+            print(f"  resolved_model    = {o.effective_model_name}  "
+                  f"(config: {o.target.model_name})")
+        elif o.effective_model_name:
+            print(f"  resolved_model    = {o.effective_model_name}")
+        else:
+            print(f"  resolved_model    = (none discovered; using "
+                  f"{o.target.model_name})")
         print(f"  supports_thinking = {o.supports_thinking}")
         print(f"  rounds={len(o.rounds)}  ok={len(oks)}  "
               f"err={len(o.rounds) - len(oks)}")
@@ -591,7 +669,7 @@ def render_json_dump(outcomes: list[BenchOutcome], cfg: BenchConfig,
     iteration.
 
     The wire format mirrors :class:`BenchOutcome` field-for-field via
-    ``dataclasses.asdict``. Two fields worth flagging for consumers:
+    ``dataclasses.asdict``. Three fields worth flagging for consumers:
 
       * ``install_status`` — the raw parsed JSON payload from
         ``olares-cli market install --watch -o json`` (or ``null`` on
@@ -600,6 +678,13 @@ def render_json_dump(outcomes: list[BenchOutcome], cfg: BenchConfig,
         ``null``) computed via :func:`derive_model_exists`. ``false``
         is the conclusive signal that the app name does not exist in
         any olares-market source; ``null`` means we couldn't decide.
+      * ``effective_model_name`` — the canonical id reported by
+        Ollama's ``GET /v1/models`` after the daemon comes up; the
+        string actually sent to ``/api/show`` and ``/api/generate``.
+        ``null`` means discovery didn't return anything, in which
+        case ``target.model_name`` was used as the fallback (and
+        likely 4xx'd, with the failure visible on each
+        ``QuestionResult.error``).
     """
     return json.dumps({
         "stamp": stamp,
@@ -708,7 +793,8 @@ def render_email_html(outcomes: list[BenchOutcome], cfg: BenchConfig,
     # status can stop after this table.
     parts.append("<h2>Per-target overview</h2>")
     parts.append("<table><thead><tr>"
-                 "<th>app</th><th>model</th>"
+                 "<th>app</th><th>model (config)</th>"
+                 "<th>model (resolved)</th>"
                  "<th>model_exists</th>"
                  "<th>install</th><th>install_dur</th>"
                  "<th>readiness</th>"
@@ -730,10 +816,26 @@ def render_email_html(outcomes: list[BenchOutcome], cfg: BenchConfig,
             readiness_cell = "<td>ready</td>"
         oks = sum(1 for q in o.rounds if q.ok)
         rounds_cell = f"<td>{oks}/{len(o.rounds)}</td>"
+        # "Resolved" cell: highlight in yellow when the daemon's id
+        # differs from the configured one — that's the case where
+        # the operator's config name needed rescuing (annotated
+        # suffix, typo, ...). When discovery returned nothing, use
+        # an em dash with a warn tint so readers know we fell back.
+        if o.effective_model_name and \
+                o.effective_model_name == o.target.model_name:
+            resolved_cell = (
+                f"<td class='prompt'>{_h(o.effective_model_name)}</td>")
+        elif o.effective_model_name:
+            resolved_cell = (
+                "<td class='prompt warn-cell'>"
+                f"{_h(o.effective_model_name)}</td>")
+        else:
+            resolved_cell = "<td class='prompt warn-cell'>—</td>"
         parts.append(
             f"<tr>"
             f"<td class='prompt'>{_h(o.target.app_name)}</td>"
             f"<td class='prompt'>{_h(o.target.model_name)}</td>"
+            f"{resolved_cell}"
             f"{exists_tag}{install_cell}{readiness_cell}{rounds_cell}"
             f"</tr>"
         )
@@ -746,8 +848,19 @@ def render_email_html(outcomes: list[BenchOutcome], cfg: BenchConfig,
 
     for o in outcomes:
         t = o.target
-        parts.append(f"<h2>{_h(t.app_name)} "
-                     f"<span class='meta'>({_h(t.model_name)})</span></h2>")
+        # Show "(config -> resolved)" in the heading when the daemon's
+        # canonical id is different from the operator-supplied one,
+        # so the rescue is obvious. When they match, fall back to
+        # the original single-name layout for visual quietness.
+        if o.effective_model_name and \
+                o.effective_model_name != t.model_name:
+            heading_suffix = (
+                f"<span class='meta'>({_h(t.model_name)} → "
+                f"{_h(o.effective_model_name)})</span>")
+        else:
+            heading_suffix = (
+                f"<span class='meta'>({_h(t.model_name)})</span>")
+        parts.append(f"<h2>{_h(t.app_name)} {heading_suffix}</h2>")
 
         # Status tag row.
         tags: list[str] = []

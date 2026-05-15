@@ -10,6 +10,8 @@ from llm_bench.clients.ollama_client import (
     _ollama_first_name,
     _ollama_max_context,
     _ollama_processor_split,
+    ollama_discover_model_id,
+    ollama_supports_thinking,
 )
 
 
@@ -120,3 +122,128 @@ class TestBuildDescriptor:
         assert out["loaded"] is False
         assert out["processor"] == "not loaded"
         assert out["total_gb"] == 0.0
+
+
+class TestOllamaSupportsThinking:
+    """Pin the contract that the probe queries the CALLER-supplied
+    model — never auto-picks from /api/ps / /api/tags.
+
+    The earlier "guess the model from the daemon's first hit" behaviour
+    silently flipped True / False between runs whenever the daemon
+    hosted more than one model: /api/ps was empty before any prompt
+    landed (so we fell back to /api/tags) and the tag ordering is
+    implementation-defined. These tests would have caught that.
+    """
+
+    def test_uses_caller_supplied_model_not_daemon_first_hit(
+            self, monkeypatch) -> None:
+        # If the helper accidentally auto-discovers, this asserts the
+        # discovered name would have been "other:7b" (NOT thinking).
+        # Passing the caller's "target:1b" must short-circuit that
+        # lookup and probe the configured name directly.
+        calls: list[str] = []
+
+        def fake_show(_base, model, *, timeout):
+            calls.append(model)
+            if model == "target:1b":
+                return {"capabilities": ["completion", "thinking"]}
+            return {"capabilities": ["completion"]}
+
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client._ollama_show", fake_show)
+        # Sentinel: any call to ps/tags helpers would prove the
+        # auto-discovery regression came back.
+        def fail_listing(*args, **kw):
+            raise AssertionError(
+                "supports_thinking must NOT call /api/ps or /api/tags")
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client._ollama_get_models_list",
+            fail_listing)
+
+        assert ollama_supports_thinking(
+            "http://ollama.local", "target:1b") is True
+        assert calls == ["target:1b"]
+
+    def test_returns_false_when_model_unknown_to_daemon(
+            self, monkeypatch) -> None:
+        # /api/show returns {} for an unknown model name (the
+        # underlying helper swallows the 4xx and yields an empty
+        # dict). The probe must collapse to False rather than raise.
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client._ollama_show",
+            lambda *a, **kw: {})
+        assert ollama_supports_thinking(
+            "http://ollama.local", "no-such:1b") is False
+
+    def test_returns_false_when_capabilities_missing(
+            self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client._ollama_show",
+            lambda *a, **kw: {"some_other_field": 1})
+        assert ollama_supports_thinking(
+            "http://ollama.local", "x:1b") is False
+
+    def test_returns_false_when_model_empty(self) -> None:
+        # Defensive: an empty model name short-circuits before any
+        # HTTP call -- a caller passing "" is a config bug, not a
+        # reason to crash.
+        assert ollama_supports_thinking("http://ollama.local", "") is False
+
+
+class TestOllamaDiscoverModelId:
+    """``/v1/models`` discovery — recovers the daemon's canonical id
+    even when the operator-supplied ``model_name`` has trailing
+    annotations like ``(Unsloth GGUF)`` that the API won't accept.
+    """
+
+    def test_returns_first_data_entry_id(self, monkeypatch) -> None:
+        body = (
+            '{"object":"list","data":[{"created":1778761066,'
+            '"id":"gemma4:26b-a4b-it-ud-q4_K_XL","object":"model",'
+            '"owned_by":"library"}]}'
+        )
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client.http_get_status",
+            lambda *a, **kw: (200, body))
+        assert (ollama_discover_model_id("http://ollama.local")
+                == "gemma4:26b-a4b-it-ud-q4_K_XL")
+
+    def test_skips_non_dict_entries_until_first_string_id(
+            self, monkeypatch) -> None:
+        body = (
+            '{"data":['
+            'null,'
+            '{"id":""},'         # empty id, skip
+            '{"id":42},'          # non-string id, skip
+            '{"id":"chosen:1b"}'
+            ']}'
+        )
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client.http_get_status",
+            lambda *a, **kw: (200, body))
+        assert (ollama_discover_model_id("http://ollama.local")
+                == "chosen:1b")
+
+    def test_returns_none_on_non_2xx(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client.http_get_status",
+            lambda *a, **kw: (503, "service unavailable"))
+        assert ollama_discover_model_id("http://ollama.local") is None
+
+    def test_returns_none_on_bad_json(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client.http_get_status",
+            lambda *a, **kw: (200, "<<not json>>"))
+        assert ollama_discover_model_id("http://ollama.local") is None
+
+    def test_returns_none_when_data_missing(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client.http_get_status",
+            lambda *a, **kw: (200, '{"object":"list"}'))
+        assert ollama_discover_model_id("http://ollama.local") is None
+
+    def test_returns_none_when_data_empty(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client.http_get_status",
+            lambda *a, **kw: (200, '{"data":[]}'))
+        assert ollama_discover_model_id("http://ollama.local") is None

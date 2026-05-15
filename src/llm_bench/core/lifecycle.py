@@ -38,6 +38,57 @@ ROLLED_BACK_STATES = {
 }
 
 
+# `--env KEY=VALUE` passed to every `olares-cli market install` call.
+#
+# Why this lives here (and not in each caller's config): every chart
+# the harness installs needs the same Hugging Face service base so
+# the in-pod model-pull side-cars know where to fetch from. Forcing
+# every model row to repeat it would be footgun-prone; centralising
+# it here means a single edit (or env override at runtime) flips
+# every install at once.
+#
+# Caller semantics: entries the caller passes in via ``ensure_installed
+# install_envs=...`` with the SAME key OVERRIDE the default — see
+# :func:`_merge_install_envs`. Set the caller-side value to an empty
+# string (``"OLARES_USER_HUGGINGFACE_SERVICE="``) to forward an empty
+# value to the chart instead of the default URL.
+_DEFAULT_INSTALL_ENVS: tuple[str, ...] = (
+    "OLARES_USER_HUGGINGFACE_SERVICE=https://huggingface.co",
+)
+
+
+def _merge_install_envs(envs: list | None) -> list[str]:
+    """Layer caller-supplied envs on top of :data:`_DEFAULT_INSTALL_ENVS`.
+
+    Each entry is a ``"KEY=VALUE"`` string passed straight through to
+    ``olares-cli market install --env``; the CLI handles its own
+    quoting so we deliberately do NOT shell-escape here. Caller
+    entries with a ``KEY`` that matches a default override the
+    default's value (last-write-wins semantics, defaults written
+    first). Strings without an ``=`` are not deduplicated and just
+    pass through verbatim — this preserves the prior behaviour where
+    callers could send arbitrary ``--env`` flags through this code
+    path even if they don't fit the KEY=VALUE shape (rare; typically
+    a shell idiom). Non-string entries are silently dropped.
+
+    The returned list places merged ``KEY=VALUE`` entries first
+    (insertion order), then any non-conforming pass-through strings
+    last; ``--env`` flag order is irrelevant to the underlying
+    helm/chart machinery, so this is purely cosmetic.
+    """
+    keyed: dict[str, str] = {}
+    passthrough: list[str] = []
+    for kv in (*_DEFAULT_INSTALL_ENVS, *(envs or [])):
+        if not isinstance(kv, str):
+            continue
+        key, eq, value = kv.partition("=")
+        if eq != "=":
+            passthrough.append(kv)
+            continue
+        keyed[key] = value
+    return [f"{k}={v}" for k, v in keyed.items()] + passthrough
+
+
 class MarketInstallFailed(RuntimeError):
     """Raised when ``olares-cli market install --watch`` exits non-zero.
 
@@ -86,6 +137,13 @@ def market_install(app: str, *, watch_minutes: int,
                    envs: list | None = None) -> dict | None:
     """Run ``olares-cli market install <app> --watch -o json``.
 
+    Always passes the entries in :data:`_DEFAULT_INSTALL_ENVS` as
+    ``--env`` flags (currently just
+    ``OLARES_USER_HUGGINGFACE_SERVICE=https://huggingface.co``).
+    Caller-supplied ``envs`` are layered on top via
+    :func:`_merge_install_envs`: same-key entries override, others
+    are appended.
+
     Returns:
         The parsed JSON status dict on success — typically
         ``{"status": "success", "finalState": "running",
@@ -106,7 +164,7 @@ def market_install(app: str, *, watch_minutes: int,
     """
     cmd = [cli(), "market", "install", app, "-o", "json",
            "--watch", "--watch-timeout", f"{watch_minutes}m"]
-    for kv in envs or []:
+    for kv in _merge_install_envs(envs):
         cmd.extend(["--env", kv])
     proc = run(cmd, timeout=watch_minutes * 60 + 60,
                capture=True, check=False)
