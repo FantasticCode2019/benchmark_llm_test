@@ -405,44 +405,58 @@ def ollama_discover_model_id(url: str, *,
     return None
 
 
-def ollama_supports_thinking(url: str, model: str, *,
+def ollama_supports_thinking(url: str, *,
                              timeout: int = HTTP_DEFAULT_TIMEOUT_SECONDS,
                              ) -> bool:
-    """Return True iff Ollama's ``/api/show`` for the **caller-supplied**
-    ``model`` lists ``thinking`` in its capabilities.
+    """Return True iff the Ollama daemon at ``url`` exposes a model
+    that lists ``thinking`` in its capabilities.
 
-    Python equivalent of (note the model is NOT auto-detected)::
+    Discovery flow (no caller-supplied model name needed)::
 
-        curl -s $HOST/api/show -d "{\\"model\\":\\"$MODEL\\"}" \\
+        GET  /v1/models                      -> data[0].id  (canonical
+                                                daemon-authoritative id)
+        POST /api/show {model: <id>}         -> capabilities[]
+        index("thinking")                    -> True / False
+
+    Equivalent shell::
+
+        ID=$(curl -s $HOST/v1/models | jq -r '.data[0].id // empty')
+        curl -s $HOST/api/show -d "{\\"model\\":\\"$ID\\"}" \\
             | jq '.capabilities | index("thinking") != null'
 
-    Determinism note: an earlier version of this helper auto-picked
-    the model name from ``/api/ps[0].name`` (currently loaded) with a
-    fallback to ``/api/tags[0].name`` (installed on disk). That
-    behaviour silently flipped True/False between runs whenever the
-    daemon hosted more than one model — ``/api/ps`` is empty before
-    the first prompt loads anything into VRAM (so we hit tags),
-    while subsequent invocations with ``skip_install_if_running`` see
-    a warm VRAM and pick from ``/api/ps`` instead. The two lists are
-    also unordered, so even within one source the ``[0]`` slot is
-    implementation-dependent. Always pass the configured model name
-    so the answer reflects THAT model, not whichever the daemon
-    happens to expose first. When the operator-supplied name is
-    known to be unreliable (annotated with ``(Unsloth GGUF)`` etc.),
-    bounce it through :func:`ollama_discover_model_id` first.
+    Why no model parameter? Operators occasionally annotate the
+    configured ``model_name`` with extra metadata (``"gemma4:26b-a4b
+    -it-ud-q4_K_XL (Unsloth GGUF)"`` and friends), which makes
+    ``/api/show`` 4xx because the bracketed suffix is part of the
+    string. Funnelling the probe through ``/v1/models`` recovers the
+    daemon-authoritative id independent of how the chart was
+    configured, eliminating that whole error class.
 
-    Any failure (daemon unreachable, ``/api/show`` 4xx for a model
-    name the daemon doesn't know, body without a ``capabilities``
-    array, ...) collapses to False — callers asked for a bool, not
-    an exception, and "we couldn't prove it supports thinking" is
-    the safe default.
+    Determinism note: an earlier iteration auto-picked the name from
+    ``/api/ps[0].name`` (currently loaded) with a fallback to
+    ``/api/tags[0].name`` (installed on disk), which silently flipped
+    True/False between runs whenever the daemon hosted more than one
+    model — both lists are unordered. ``/v1/models`` is the
+    OpenAI-compat catalogue; in our pipeline each ``bench_model``
+    invocation runs against a freshly-installed chart that has
+    exactly one model, so ``data[0].id`` is unambiguous.
+
+    Any failure (``/v1/models`` empty / unreachable, ``/api/show``
+    4xx, body without a ``capabilities`` array, ...) collapses to
+    False — callers asked for a bool, not an exception, and "we
+    couldn't prove it supports thinking" is the safe default.
     """
-    if not model:
+    base = url.rstrip("/")
+    model_id = ollama_discover_model_id(base, timeout=timeout)
+    log.info("ollama supports thinking: model_id=%s", model_id)
+    if not model_id:
         return False
-    show = _ollama_show(url.rstrip("/"), model, timeout=timeout)
+    show = _ollama_show(base, model_id, timeout=timeout)
     caps = show.get("capabilities") if isinstance(show, dict) else None
     if not isinstance(caps, list):
+        log.info("ollama supports thinking: not a list")
         return False
+    log.info("ollama supports thinking: caps=%s", caps)
     return "thinking" in caps
 
 

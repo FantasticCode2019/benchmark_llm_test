@@ -502,37 +502,19 @@ def prepare_outcome(outcome: BenchOutcome,
     # configured `target.model_name` has trailing annotations the
     # ollama daemon won't accept (``"... (Unsloth GGUF)"`` etc.).
     try:
-        discovered = ollama_discover_model_id(
-            outcome.entrance_url, timeout=cfg.request_timeout_seconds)
+        outcome.effective_model_name = ollama_discover_model_id(outcome.entrance_url, timeout=cfg.request_timeout_seconds) or target.model_name
     except Exception as exc:
-        log.warning("[discover] %s /v1/models lookup raised: %s",
-                    target.app_name, exc)
-        discovered = None
-    if discovered:
-        outcome.effective_model_name = discovered
-        if discovered != target.model_name:
-            log.warning("[discover] %s: configured model_name %r "
-                        "differs from /v1/models id %r — using the "
-                        "daemon's id for /api/show & /api/generate",
-                        target.app_name, target.model_name, discovered)
-        else:
-            log.info("[discover] %s: /v1/models confirms id %r",
-                     target.app_name, discovered)
-    else:
-        log.warning("[discover] %s: /v1/models returned no usable id; "
-                    "falling back to configured %r (may 4xx)",
-                    target.app_name, target.model_name)
+        log.warning("[discover] %s /v1/models lookup raised: %s", target.app_name, exc)
 
-    # supports_thinking probe — pin to the effective id so the
-    # answer reflects THIS model (see ollama_supports_thinking
-    # docstring for the determinism reasoning).
-    effective = outcome.api_model_name
+    # supports_thinking probe — the helper internally resolves the
+    # daemon-authoritative id via /v1/models, so we don't have to
+    # pre-resolve it here.
     try:
         outcome.supports_thinking = ollama_supports_thinking(
-            outcome.entrance_url, effective,
+            outcome.entrance_url,
             timeout=cfg.request_timeout_seconds)
-        log.info("[probe] %s (%s) supports_thinking=%s",
-                 target.app_name, effective, outcome.supports_thinking)
+        log.info("[probe] %s supports_thinking=%s",
+                 target.app_name, outcome.supports_thinking)
     except Exception as exc:
         log.warning("[probe] %s supports_thinking failed: %s",
                     target.app_name, exc)

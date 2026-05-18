@@ -125,34 +125,36 @@ class TestBuildDescriptor:
 
 
 class TestOllamaSupportsThinking:
-    """Pin the contract that the probe queries the CALLER-supplied
-    model — never auto-picks from /api/ps / /api/tags.
+    """Pin the contract that the probe self-resolves the model id via
+    ``/v1/models`` (no caller-supplied name) and then queries
+    ``/api/show`` for ``capabilities[]``.
 
-    The earlier "guess the model from the daemon's first hit" behaviour
-    silently flipped True / False between runs whenever the daemon
-    hosted more than one model: /api/ps was empty before any prompt
-    landed (so we fell back to /api/tags) and the tag ordering is
-    implementation-defined. These tests would have caught that.
+    Why no caller-supplied name? Operators sometimes annotate the
+    configured ``model_name`` (``"… (Unsloth GGUF)"``) which makes
+    ``/api/show`` 4xx because the bracketed suffix is part of the
+    string. Funnelling through ``/v1/models`` recovers the
+    daemon-authoritative id, eliminating that error class.
     """
 
-    def test_uses_caller_supplied_model_not_daemon_first_hit(
+    def test_uses_v1_models_id_not_caller_input(
             self, monkeypatch) -> None:
-        # If the helper accidentally auto-discovers, this asserts the
-        # discovered name would have been "other:7b" (NOT thinking).
-        # Passing the caller's "target:1b" must short-circuit that
-        # lookup and probe the configured name directly.
+        # /v1/models returns the canonical id; the probe must use
+        # exactly that id when calling /api/show, NOT whatever the
+        # operator may have configured upstream.
         calls: list[str] = []
 
         def fake_show(_base, model, *, timeout):
             calls.append(model)
-            if model == "target:1b":
-                return {"capabilities": ["completion", "thinking"]}
-            return {"capabilities": ["completion"]}
+            return {"capabilities": ["completion", "thinking"]}
 
         monkeypatch.setattr(
+            "llm_bench.clients.ollama_client.ollama_discover_model_id",
+            lambda *a, **kw: "canonical:1b")
+        monkeypatch.setattr(
             "llm_bench.clients.ollama_client._ollama_show", fake_show)
-        # Sentinel: any call to ps/tags helpers would prove the
-        # auto-discovery regression came back.
+        # Sentinel: the legacy auto-pick from /api/ps + /api/tags must
+        # stay dead — they are unordered and would re-introduce the
+        # determinism bug the v0 helper had.
         def fail_listing(*args, **kw):
             raise AssertionError(
                 "supports_thinking must NOT call /api/ps or /api/tags")
@@ -160,34 +162,56 @@ class TestOllamaSupportsThinking:
             "llm_bench.clients.ollama_client._ollama_get_models_list",
             fail_listing)
 
-        assert ollama_supports_thinking(
-            "http://ollama.local", "target:1b") is True
-        assert calls == ["target:1b"]
+        assert ollama_supports_thinking("http://ollama.local") is True
+        assert calls == ["canonical:1b"]
 
-    def test_returns_false_when_model_unknown_to_daemon(
+    def test_returns_false_when_v1_models_returns_no_id(
             self, monkeypatch) -> None:
-        # /api/show returns {} for an unknown model name (the
-        # underlying helper swallows the 4xx and yields an empty
-        # dict). The probe must collapse to False rather than raise.
+        # /v1/models couldn't surface a usable id (transport error,
+        # empty data[], non-JSON, ...). The probe collapses to False
+        # without ever touching /api/show.
+        def fail_show(*args, **kw):
+            raise AssertionError(
+                "must NOT call /api/show when discovery yielded no id")
+
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client.ollama_discover_model_id",
+            lambda *a, **kw: None)
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client._ollama_show", fail_show)
+        assert ollama_supports_thinking("http://ollama.local") is False
+
+    def test_returns_false_when_show_empty(self, monkeypatch) -> None:
+        # Discovery succeeded but /api/show returned {} (4xx or
+        # transport error already swallowed by the helper). Probe
+        # must collapse to False rather than raise.
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client.ollama_discover_model_id",
+            lambda *a, **kw: "x:1b")
         monkeypatch.setattr(
             "llm_bench.clients.ollama_client._ollama_show",
             lambda *a, **kw: {})
-        assert ollama_supports_thinking(
-            "http://ollama.local", "no-such:1b") is False
+        assert ollama_supports_thinking("http://ollama.local") is False
 
     def test_returns_false_when_capabilities_missing(
             self, monkeypatch) -> None:
         monkeypatch.setattr(
+            "llm_bench.clients.ollama_client.ollama_discover_model_id",
+            lambda *a, **kw: "x:1b")
+        monkeypatch.setattr(
             "llm_bench.clients.ollama_client._ollama_show",
             lambda *a, **kw: {"some_other_field": 1})
-        assert ollama_supports_thinking(
-            "http://ollama.local", "x:1b") is False
+        assert ollama_supports_thinking("http://ollama.local") is False
 
-    def test_returns_false_when_model_empty(self) -> None:
-        # Defensive: an empty model name short-circuits before any
-        # HTTP call -- a caller passing "" is a config bug, not a
-        # reason to crash.
-        assert ollama_supports_thinking("http://ollama.local", "") is False
+    def test_returns_false_when_capabilities_present_but_no_thinking(
+            self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client.ollama_discover_model_id",
+            lambda *a, **kw: "x:1b")
+        monkeypatch.setattr(
+            "llm_bench.clients.ollama_client._ollama_show",
+            lambda *a, **kw: {"capabilities": ["completion", "vision"]})
+        assert ollama_supports_thinking("http://ollama.local") is False
 
 
 class TestOllamaDiscoverModelId:
