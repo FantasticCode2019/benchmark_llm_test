@@ -74,6 +74,7 @@ from openpyxl.utils import get_column_letter
 
 from llm_bench.constants import LOG_NAMESPACE
 from llm_bench.domain import ApiType, ModelResult, QuestionResult
+from llm_bench.utils.format import preview_prompt
 
 log = logging.getLogger(LOG_NAMESPACE)
 
@@ -250,7 +251,7 @@ def _write_prompt_banner(ws, prompt_idx: int, prompt: str) -> None:
     question that produced the row data below.
     """
     banner = ws.cell(row=1, column=1,
-                     value=f"Prompt {prompt_idx + 1}: {prompt}")
+                     value=f"Prompt {prompt_idx + 1}: {preview_prompt(prompt)}")
     banner.font = Font(bold=True, color="111111", size=12)
     banner.fill = PatternFill(start_color="EAF1FF",
                               end_color="EAF1FF",

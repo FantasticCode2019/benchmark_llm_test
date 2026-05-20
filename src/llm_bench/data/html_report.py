@@ -13,7 +13,7 @@ from __future__ import annotations
 from html import escape as html_escape
 
 from llm_bench.domain import ModelResult, QuestionResult
-from llm_bench.utils.format import fmt_duration
+from llm_bench.utils.format import fmt_duration, preview_prompt
 from llm_bench.utils.time_utils import utc_now_naive
 
 
@@ -205,6 +205,7 @@ def _prompt_section(results: list[ModelResult], prompt_idx: int,
         rows.append(_model_row(r, prompt_idx, bg=bg))
 
     banner_label = f"Prompt {prompt_idx + 1}"
+    prompt_preview = preview_prompt(prompt)
     return (
         '<div style="margin:18px 0 0 0">'
         # Prompt banner — sized like a small section heading so the
@@ -213,7 +214,7 @@ def _prompt_section(results: list[ModelResult], prompt_idx: int,
         'background:#eaf1ff;border-radius:6px;'
         'font-size:13px;color:#111;line-height:1.45">'
         f'<span style="font-weight:700">{html_escape(banner_label)}:</span> '
-        f'<span style="color:#333">{html_escape(prompt)}</span>'
+        f'<span style="color:#333">{html_escape(prompt_preview)}</span>'
         '</div>'
         # Per-prompt table.
         '<div style="border:1px solid #e5e7eb;border-radius:8px;'

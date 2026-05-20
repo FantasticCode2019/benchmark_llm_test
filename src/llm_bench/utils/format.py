@@ -24,3 +24,6 @@ def fmt_duration(seconds: float) -> str:
         return f"{m}m {s:02d}s"
     h, m = divmod(m, 60)
     return f"{h}h {m:02d}m"
+
+def preview_prompt(prompt: str, limit: int = 80) -> str:
+    return prompt[:limit] if len(prompt) > limit else prompt
