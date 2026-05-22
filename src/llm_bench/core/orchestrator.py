@@ -50,7 +50,7 @@ from llm_bench.domain import (
     ResolvedOptions,
 )
 from llm_bench.utils.cli_runner import cli
-from llm_bench.utils.time_utils import utc_now_naive
+from llm_bench.utils.time_utils import BEIJING_ISO_SUFFIX, beijing_now_naive
 
 log = logging.getLogger(LOG_NAMESPACE)
 
@@ -78,7 +78,8 @@ def bench_model(spec: ModelSpec, prompts: list[str],
         openai=openai_config_from(spec, cfg),
         result=ModelResult(app_name=spec.app_name, model=spec.model_name,
                            api_type=opts.api_type,
-                           started_at=utc_now_naive().isoformat() + "Z"),
+                           started_at=beijing_now_naive().isoformat()
+                           + BEIJING_ISO_SUFFIX),
         model_name=spec.model_name,
         prompts=list(prompts),
     )
@@ -100,7 +101,8 @@ def bench_model(spec: ModelSpec, prompts: list[str],
     finally:
         _step_archive_pod_logs(ctx, post_uninstall_failure=False)
         _step_uninstall(ctx)
-        ctx.result.finished_at = utc_now_naive().isoformat() + "Z"
+        ctx.result.finished_at = (beijing_now_naive().isoformat()
+                                  + BEIJING_ISO_SUFFIX)
 
     return ctx.result
 

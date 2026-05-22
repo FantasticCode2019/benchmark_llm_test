@@ -13,7 +13,7 @@ import subprocess
 from llm_bench.constants import LOG_NAMESPACE
 from llm_bench.domain import InstallDecision
 from llm_bench.utils.cli_runner import cli, run
-from llm_bench.utils.time_utils import utc_now_naive
+from llm_bench.utils.time_utils import beijing_now_naive
 
 log = logging.getLogger(LOG_NAMESPACE)
 
@@ -380,7 +380,7 @@ def archive_pod_logs(app: str, *, output_dir: str = "/tmp",
                     app, output_dir, exc)
         return None
 
-    stamp = utc_now_naive().strftime("%Y%m%d_%H%M%S")
+    stamp = beijing_now_naive().strftime("%Y%m%d_%H%M%S")
     archive = os.path.join(output_dir, f"{app}_logs_{stamp}.tar.gz")
     log.info("archiving %d pod log dir(s) for %s into %s%s",
              len(matches), app, archive,

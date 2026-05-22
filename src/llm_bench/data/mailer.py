@@ -11,7 +11,7 @@ from email.mime.text import MIMEText
 
 from llm_bench.constants import LOG_NAMESPACE
 from llm_bench.domain import EmailConfig
-from llm_bench.utils.time_utils import utc_now_naive
+from llm_bench.utils.time_utils import beijing_now_naive
 
 log = logging.getLogger(LOG_NAMESPACE)
 
@@ -21,7 +21,7 @@ def _render_subject(template: str, stamp: str) -> str:
     in the configured subject. Unknown braces are left untouched (so a
     literal ``{foo}`` in the subject doesn't blow up).
     """
-    now = utc_now_naive()
+    now = beijing_now_naive()
     return (template
             .replace("{date}", now.strftime("%Y-%m-%d"))
             .replace("{datetime}", now.strftime("%Y-%m-%d %H:%M"))

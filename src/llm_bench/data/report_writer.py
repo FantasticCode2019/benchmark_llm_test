@@ -11,7 +11,7 @@ from llm_bench.constants import LOG_NAMESPACE
 from llm_bench.data.excel_report import render_ollama_excel
 from llm_bench.data.html_report import render_html
 from llm_bench.domain import ModelResult
-from llm_bench.utils.time_utils import utc_now_naive
+from llm_bench.utils.time_utils import beijing_now_naive
 
 log = logging.getLogger(LOG_NAMESPACE)
 
@@ -43,7 +43,7 @@ def write_reports(results: list[ModelResult],
     :mod:`llm_bench.data.excel_report` for the column contract.
     """
     os.makedirs(out_dir, exist_ok=True)
-    stamp = utc_now_naive().strftime("%Y%m%d-%H%M%S")
+    stamp = beijing_now_naive().strftime("%Y%m%d-%H%M%S")
     json_path = os.path.join(out_dir, f"llm_bench_{stamp}.json")
     html_path = os.path.join(out_dir, f"llm_bench_{stamp}.html")
 

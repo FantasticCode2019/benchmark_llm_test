@@ -14,7 +14,7 @@ from html import escape as html_escape
 
 from llm_bench.domain import ModelResult, QuestionResult
 from llm_bench.utils.format import fmt_duration, preview_prompt
-from llm_bench.utils.time_utils import utc_now_naive
+from llm_bench.utils.time_utils import beijing_now_naive
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +277,7 @@ def _empty_body(subtitle: str) -> str:
         '<div style="font-size:20px;font-weight:600;color:#111;'
         'margin-bottom:2px">Olares LLM benchmark</div>'
         f'<div style="color:#666;font-size:13px">'
-        f'{utc_now_naive().strftime("%Y-%m-%d %H:%M UTC")}'
+        f'{beijing_now_naive().strftime("%Y-%m-%d %H:%M 北京时间")}'
         f' &middot; {subtitle}</div>'
         '</div>'
         '<div style="border:1px solid #e5e7eb;border-radius:8px;'
@@ -361,7 +361,7 @@ def render_html(results: list[ModelResult]) -> str:
         '<div style="font-size:20px;font-weight:600;color:#111;'
         'margin-bottom:2px">Olares LLM benchmark</div>'
         f'<div style="color:#666;font-size:13px">'
-        f'{utc_now_naive().strftime("%Y-%m-%d %H:%M UTC")}'
+        f'{beijing_now_naive().strftime("%Y-%m-%d %H:%M 北京时间")}'
         f' &middot; {subtitle}</div>'
         '</div>'
         + "".join(sections)

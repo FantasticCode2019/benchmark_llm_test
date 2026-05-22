@@ -119,7 +119,7 @@ benchmark_llm_test/
 │           ├── http.py              #   通用 GET / POST / JSON helpers（无业务语义）
 │           ├── format.py            #   human_bytes + fmt_duration
 │           ├── tokens.py            #   rough_token_count + ms_to_seconds + to_float
-│           └── time_utils.py        #   utc_now_naive()（替代 deprecated datetime.utcnow）
+│           └── time_utils.py        #   beijing_now_naive() + BEIJING_ISO_SUFFIX（北京时间 UTC+8）
 └── tests/                           # smoke 单测（pytest，纯函数 + dataclass 边界）
     ├── test_format.py
     ├── test_tokens.py

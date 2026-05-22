@@ -82,7 +82,7 @@ from llm_bench.data.mailer import send_email  # noqa: E402
 from llm_bench.domain import EmailConfig, QuestionResult  # noqa: E402
 from llm_bench.exceptions import ConfigValidationError  # noqa: E402
 from llm_bench.utils.cli_runner import set_cli_path  # noqa: E402
-from llm_bench.utils.time_utils import utc_now_naive  # noqa: E402
+from llm_bench.utils.time_utils import beijing_now_naive  # noqa: E402
 
 log = logging.getLogger(LOG_NAMESPACE)
 
@@ -1044,7 +1044,7 @@ def main() -> int:
              args.config, len(cfg.targets), len(cfg.prompts),
              "configured" if cfg.email else "disabled")
 
-    stamp = utc_now_naive().strftime("%Y%m%d_%H%M%S")
+    stamp = beijing_now_naive().strftime("%Y%m%d_%H%M%S")
 
     installs = install_sequential(cfg)
     # Phase A — build one outcome per target and do readiness/thinking
