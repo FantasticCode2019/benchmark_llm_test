@@ -44,14 +44,25 @@ Column layout (kept stable; mirrored by the column header row):
     OK                      "Yes" / "No" — this prompt's QuestionResult.ok
     TTFT (s)                this prompt's QuestionResult.ttft_seconds
     Think TTFT (s)          this prompt's QuestionResult.thinking_ttft_seconds
-    TPS                     this prompt's QuestionResult.tps
-    Tokens                  this prompt's QuestionResult.eval_count
-    Wall (s)                this prompt's QuestionResult.wall_seconds
+    TPS                     QuestionResult.tps — Tokens / eval_seconds
+                            (decode-only throughput; same denominator
+                            across Ollama and OpenAI-compatible backends)
+    Tokens                  QuestionResult.eval_count — generated tokens
+                            for this prompt (Ollama: server-reported
+                            eval_count; OpenAI: usage.completion_tokens
+                            from the final stream chunk, falling back
+                            to rough_token_count when absent)
+    Wall (s)                QuestionResult.wall_seconds — client wall
+                            clock from urlopen to the final stream chunk
+    Load (s)                QuestionResult.load_seconds — server-reported
+                            load_duration (disk → VRAM load before
+                            generation). Reused/warm models trend toward
+                            ~0; cold first request shows seconds.
     Server (s)              this prompt's QuestionResult.total_server_seconds
     Install Decision        "fresh" / "reused" / "recovered" / ""
     Install (s)             ModelResult.install_seconds
     Uninstall (s)           ModelResult.uninstall_seconds (0 if skipped)
-    Started / Finished      UTC ISO timestamps from the run
+    Started / Finished      Beijing ISO timestamps (UTC+8) from the run
     Endpoint                base URL the benchmark used
     Error                   per-prompt error if any, else model-level error
 
@@ -103,6 +114,7 @@ _COLUMNS: list[tuple[str, str]] = [
     ("TPS",                  "tps"),
     ("Tokens",               "eval_count"),
     ("Wall (s)",             "wall"),
+    ("Load (s)",             "load_seconds"),
     ("Server (s)",           "total_server"),
     ("Install Decision",     "install_decision"),
     ("Install (s)",          "install_seconds"),
@@ -171,6 +183,7 @@ def _row_for(result: ModelResult, prompt_idx: int) -> list[Any]:
         tps: Any = ""
         eval_count: Any = ""
         wall: Any = ""
+        load_seconds: Any = ""
         total_server: Any = ""
         error_text = result.error or "did not reach this prompt"
     else:
@@ -180,6 +193,7 @@ def _row_for(result: ModelResult, prompt_idx: int) -> list[Any]:
         tps = round(qr.tps, 2)
         eval_count = qr.eval_count
         wall = round(qr.wall_seconds, 3)
+        load_seconds = round(qr.load_seconds, 3)
         total_server = round(qr.total_server_seconds, 3)
         # Per-prompt error wins over model-level error (which may also
         # be set if a *later* prompt raised). When neither is set the
@@ -210,6 +224,7 @@ def _row_for(result: ModelResult, prompt_idx: int) -> list[Any]:
         "tps": tps,
         "eval_count": eval_count,
         "wall": wall,
+        "load_seconds": load_seconds,
         "total_server": total_server,
         "install_decision": str(result.install_decision or ""),
         "install_seconds": result.install_seconds,

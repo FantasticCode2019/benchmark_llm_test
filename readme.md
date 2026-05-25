@@ -102,8 +102,8 @@ benchmark_llm_test/
 │       │   ├── readiness.py         #   wait_until_api_ready (双 backend 协议)
 │       │   ├── orchestrator.py      #   bench_model() 单模型流水线（8 个 _step_* 子阶段）
 │       │   └── benchmark/
-│       │       ├── ollama.py        #     /api/generate (+ thinking 流式探针)
-│       │       └── openai.py        #     /v1/chat/completions (+ thinking 流式探针, openai SDK)
+│       │       ├── ollama.py        #     /api/generate (stream=true，单请求拿 TTFT + 服务器 eval 统计)
+│       │       └── openai.py        #     /v1/chat/completions (stream=true，openai SDK，单请求拿 TTFT + eval_dur)
 │       ├── data/                    # I/O 层
 │       │   ├── config.py            #   load_config + setup_logging
 │       │   ├── html_report.py       #   render_html (inline-CSS 邮件表格)
@@ -227,7 +227,7 @@ vLLM / LLaMA.cpp / 其他 OpenAI-compatible 后端共用的默认参数。每个
 | `top_p` | `null` | nucleus 采样；`null` 表示不发 |
 | `extra_headers` | `{}` | 整体合并进请求头 |
 | `extra_body` | `{}` | 整体合并进 payload，例如 `{"top_k":50,"repetition_penalty":1.05}` |
-| `measure_ttft_approx` | `true` | true 时在每条 prompt 前先测 TTFT：`spec.thinking=true` 走流式探针（首个 `delta.content` → `ttft_seconds`、首个 `delta.reasoning` → `thinking_ttft_seconds`），失败则退到 `max_tokens=1` round-trip；`spec.thinking=false` 直接走 `max_tokens=1`。**false 时整段跳过**：`ttft_seconds=0` |
+| `measure_ttft_approx` | `true` | **已废弃 / no-op**。主请求改成 `stream=true` 之后，`ttft_seconds`（首个 `delta.content`）和 `thinking_ttft_seconds`（首个 `delta.reasoning` / `delta.reasoning_content`）会无条件从同一个流里取真值，不再有额外探针。该字段保留只为不破坏旧 config |
 
 ### `email` 子对象（必填）
 

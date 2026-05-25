@@ -1,17 +1,49 @@
 """OpenAI-compatible benchmark (vLLM / llama.cpp / oai-compat).
 
-Mirrors scripts/llm_api_benchmark.py so numbers are comparable:
-  - per-call max_tokens / temperature / top_p / extra_body
-  - optional Bearer auth header (llama-server `--api-key` mode)
-  - TTFT approximated via a separate max_tokens=1 round-trip
-  - llama.cpp `timings` block is decoded when present so we surface
-    real server-side decode tokens/s, not just the wall-clock estimate
-  - per-model `spec.thinking=true` triggers ONE extra streaming probe
-    that asks vLLM to render with
-        extra_body={"chat_template_kwargs": {"thinking": True}}
-    via the official `openai` SDK and reads the first reasoning
-    delta into `thinking_ttft_seconds`. Whether the model has a
-    thinking phase is taken straight from config — no auto-detection.
+ONE streaming /v1/chat/completions (or /v1/completions) request per
+prompt — same shape as the Ollama benchmark, so all per-prompt metrics
+live in the same coordinate system:
+
+  * ``wall_seconds`` — client-observed wall clock from
+    ``urlopen`` to the final chunk. End-to-end "how long the caller
+    waited for the full response".
+
+  * ``ttft_seconds`` — client-observed wall clock to the first
+    non-empty ``delta.content`` chunk. Real TTFT, not an
+    approximation — captured for free as part of the same stream.
+
+  * ``thinking_ttft_seconds`` — client-observed wall clock to the
+    first non-empty ``delta.reasoning`` /
+    ``delta.reasoning_content`` chunk. Populated only when the
+    per-model ``spec.thinking=true`` flag is set AND the model
+    actually emits a reasoning delta. vLLM / Qwen3 / DeepSeek-R1
+    chat templates honor ``extra_body={"chat_template_kwargs":
+    {"thinking": True}}`` to opt the render into emitting these
+    deltas.
+
+  * ``eval_count`` — preferred from the final usage-only chunk
+    (``chunk.usage.completion_tokens``) emitted by servers that
+    honor ``stream_options={"include_usage": True}`` (vLLM,
+    llama.cpp). Falls back to ``rough_token_count(answer)`` with
+    ``tokens_estimated=True`` when the server skips the usage
+    chunk.
+
+  * ``eval_seconds`` — **decode duration** observed client-side as
+    ``last_content_delta_at - first_content_delta_at``. This is the
+    time the model spent emitting answer tokens, excluding prefill
+    and post-DONE network latency. For single-token responses
+    where this collapses to ~0, falls back to ``wall - ttft``.
+
+  * ``tps`` — **decode-only** generated-tokens-per-second
+    (``eval_count / eval_seconds``). Pure "how fast the model emits
+    tokens once it starts" reading, directly comparable with the
+    Ollama backend. Wall-clock throughput
+    (``eval_count / wall_seconds``) is preserved separately as
+    ``client_tps`` for diagnostics.
+
+The ``measure_ttft_approx`` config knob is preserved for backward
+compatibility but is now a NO-OP — streaming gives us real TTFT
+unconditionally, so there is no extra round-trip to opt out of.
 """
 from __future__ import annotations
 
@@ -20,7 +52,7 @@ import time
 
 from openai import OpenAI
 
-from llm_bench.clients.openai_errors import auth_hint, post_openai
+from llm_bench.clients.openai_errors import auth_hint
 from llm_bench.constants import LOG_NAMESPACE
 from llm_bench.domain import AppConfig, ModelSpec, OpenAIConfig, QuestionResult
 from llm_bench.utils.tokens import ms_to_seconds, rough_token_count, to_float
@@ -58,111 +90,6 @@ def openai_config_from(spec: ModelSpec, cfg: AppConfig) -> OpenAIConfig:
     )
 
 
-def openai_url(base: str, endpoint: str) -> str:
-    base = base.rstrip("/")
-    suffix = "/completions" if endpoint == "completion" else "/chat/completions"
-    return base + suffix if base.endswith("/v1") else base + "/v1" + suffix
-
-
-def openai_headers(api_key: str, extra: dict) -> dict:
-    """Mirrors `curl` semantics: only sends `Authorization: Bearer ...`
-    when the user actually set a key — `EMPTY` (or empty string) is
-    treated as "no auth". `extra_headers` from config can override.
-    """
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if api_key and api_key.strip().upper() not in {"", "EMPTY"}:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if extra:
-        headers.update({str(k): str(v) for k, v in extra.items()})
-    return headers
-
-
-def build_openai_payload(model: str, prompt: str, conf: OpenAIConfig,
-                         *, max_tokens_override: int | None = None) -> dict:
-    mt = (max_tokens_override
-          if max_tokens_override is not None else conf.max_tokens)
-    # IMPORTANT: stream=False is REQUIRED. The whole script parses the
-    # response as a single JSON object; with stream=True the server replies
-    # with SSE chunks and json.loads() blows up.
-    if conf.endpoint == "completion":
-        payload: dict = {
-            "prompt": prompt,
-            "stream": False,
-            "max_tokens": mt,
-            "temperature": conf.temperature,
-        }
-    else:
-        payload = {
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-            "max_tokens": mt,
-            "temperature": conf.temperature,
-        }
-    if conf.top_p is not None:
-        payload["top_p"] = conf.top_p
-    if conf.extra_body:
-        payload.update(conf.extra_body)
-    return payload
-
-
-def _extract_openai_response(body: dict) -> dict:
-    """Pull answer + token + (optional) server timings out of the response.
-    Handles both Chat Completion and the legacy Completion shape.
-    llama-server's OpenAI endpoint additionally exposes a `timings` block
-    with millisecond precision; vLLM does not.
-    """
-    choices = body.get("choices") or []
-    answer = ""
-    if choices:
-        first = choices[0] or {}
-        msg = first.get("message")
-        if isinstance(msg, dict):
-            answer = msg.get("content") or ""
-        else:
-            answer = first.get("text") or ""
-
-    usage = body.get("usage") or {}
-    completion = usage.get("completion_tokens")
-    prompt = usage.get("prompt_tokens")
-    total = usage.get("total_tokens")
-
-    timings = body.get("timings") or body.get("timing") or {}
-    server_prompt = ms_to_seconds(
-        timings.get("prompt_ms") or timings.get("prompt_eval_ms"))
-    server_gen = ms_to_seconds(
-        timings.get("predicted_ms") or timings.get("generation_ms")
-        or timings.get("eval_ms"))
-    server_tps = to_float(
-        timings.get("predicted_per_second") or timings.get("tokens_per_second"))
-
-    return {
-        "answer": answer,
-        "completion_tokens": int(completion) if completion is not None else None,
-        "prompt_tokens": int(prompt) if prompt is not None else None,
-        "total_tokens": int(total) if total is not None else None,
-        "server_prompt_eval_seconds": server_prompt,
-        "server_generation_seconds": server_gen,
-        "server_tps": server_tps,
-    }
-
-
-def _measure_openai_ttft(url: str, model: str, prompt: str,
-                         conf: OpenAIConfig,
-                         *, timeout: int) -> float | None:
-    """Approximate TTFT via a max_tokens=1 round-trip. Returns None on
-    failure — caller treats that as "no measurement".
-    """
-    full = openai_url(url, conf.endpoint)
-    headers = openai_headers(conf.api_key, conf.extra_headers)
-    payload = build_openai_payload(model, prompt, conf, max_tokens_override=1)
-    try:
-        wall, _ = post_openai(full, payload, headers, timeout=timeout)
-        return wall
-    except Exception as exc:
-        log.debug("ttft probe failed: %s", exc)
-        return None
-
-
 def _openai_base_url(url: str) -> str:
     """`OpenAI(base_url=...)` expects the path to end at /v1; the rest of
     this module uses the raw entrance URL (which may or may not end at
@@ -177,8 +104,9 @@ def _openai_base_url(url: str) -> str:
 def _make_openai_client(url: str, conf: OpenAIConfig,
                         *, timeout: int) -> OpenAI:
     """Construct a per-request OpenAI client. We disable retries because
-    a probe is supposed to surface the FIRST observed failure, not paper
-    over it with silent retry latency that would distort TTFT readings.
+    a benchmark is supposed to surface the FIRST observed failure, not
+    paper over it with silent retry latency that would distort the
+    timing readings.
     """
     api_key = conf.api_key
     if not api_key or api_key.strip().upper() == "EMPTY":
@@ -212,81 +140,196 @@ def _merge_thinking_extra_body(base: dict | None) -> dict:
     return out
 
 
-def _measure_openai_streaming_ttfts(url: str, model: str, prompt: str,
-                                    conf: OpenAIConfig,
-                                    *, timeout: int,
-                                    ) -> tuple[float | None,
-                                               float | None]:
-    """Open ONE streaming /v1/chat/completions request via the `openai`
-    SDK with `extra_body={"chat_template_kwargs": {"thinking": True}}`
-    and capture both the first reasoning delta and the first content
-    delta. Returns `(thinking_ttft, answer_ttft)`; either field is
-    None when not observed (probe failure, no reasoning emitted, etc.).
+def _build_stream_kwargs(model: str, prompt: str, conf: OpenAIConfig,
+                        *, thinking: bool) -> tuple[dict, bool]:
+    """Assemble kwargs for the streaming SDK call. Returns ``(kwargs,
+    is_chat)`` — ``is_chat=False`` means use the legacy /v1/completions
+    surface (``client.completions.create``) which carries ``text`` on
+    each choice instead of ``delta.content``.
 
-    Per the user-supplied vLLM snippet (cankao.md):
-
-        client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            extra_body={"chat_template_kwargs": {"thinking": True}},
-        )
-
-    Only invoked when `spec.thinking=true` AND
-    `conf.measure_ttft_approx=true`. Replaces the max_tokens=1 ping
-    for those models so we don't pay for an extra round-trip.
+    ``stream_options={"include_usage": True}`` asks the server to emit
+    a final usage-only chunk. vLLM, llama.cpp and most oai-compat
+    backends honor this; servers that don't simply omit the usage
+    chunk and we fall back to a char-based token estimate.
     """
-    client = _make_openai_client(url, conf, timeout=timeout)
-    extra_body = _merge_thinking_extra_body(conf.extra_body)
+    extra_body = (_merge_thinking_extra_body(conf.extra_body)
+                  if thinking else dict(conf.extra_body or {}))
+
     kwargs: dict = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
         "stream": True,
         "max_tokens": conf.max_tokens,
         "temperature": conf.temperature,
         "extra_body": extra_body,
+        "stream_options": {"include_usage": True},
     }
     if conf.top_p is not None:
         kwargs["top_p"] = conf.top_p
 
-    thinking_ttft: float | None = None
-    answer_ttft: float | None = None
-    stream = None
-    started = time.perf_counter()
-    try:
-        stream = client.chat.completions.create(**kwargs)
-        for chunk in stream:
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            delta = getattr(choices[0], "delta", None)
-            if delta is None:
-                continue
-            reasoning = (getattr(delta, "reasoning", None)
-                         or getattr(delta, "reasoning_content", None))
-            content = getattr(delta, "content", None)
+    if conf.endpoint == "completion":
+        kwargs["prompt"] = prompt
+        return kwargs, False
 
-            if reasoning and thinking_ttft is None:
-                thinking_ttft = time.perf_counter() - started
-            if content and answer_ttft is None:
-                answer_ttft = time.perf_counter() - started
+    kwargs["messages"] = [{"role": "user", "content": prompt}]
+    return kwargs, True
 
-            if (thinking_ttft is not None
-                    and answer_ttft is not None):
-                break
-    except Exception as exc:
-        log.warning("openai streaming ttft probe failed: %s",
-                    str(exc)[:240])
+
+def _extract_chat_deltas(chunk) -> tuple[str | None, str | None]:
+    """Pull (reasoning, content) text out of one chat-completions chunk.
+    Either side can be None when the chunk doesn't carry that delta.
+    """
+    choices = getattr(chunk, "choices", None) or []
+    if not choices:
         return None, None
-    finally:
-        # Closing the response releases the underlying httpx connection
-        # so the server stops generating tokens we're never going to read.
-        if stream is not None:
-            try:
-                stream.close()
-            except Exception:
-                pass
+    delta = getattr(choices[0], "delta", None)
+    if delta is None:
+        return None, None
+    reasoning = (getattr(delta, "reasoning", None)
+                 or getattr(delta, "reasoning_content", None))
+    content = getattr(delta, "content", None)
+    return reasoning, content
 
-    return thinking_ttft, answer_ttft
+
+def _extract_completion_text(chunk) -> str | None:
+    """Pull the streamed `text` payload out of a legacy /v1/completions
+    chunk. Returns None when the chunk is empty.
+    """
+    choices = getattr(chunk, "choices", None) or []
+    if not choices:
+        return None
+    return getattr(choices[0], "text", None)
+
+
+def _extract_server_timings(chunk) -> dict:
+    """llama.cpp emits its `timings` block inline on each streamed chunk
+    (most reliably on the final one). vLLM does not. Read it whenever
+    present so we can populate `prompt_eval_seconds` /
+    `server_tps_reported` diagnostics for free.
+    """
+    timings = (getattr(chunk, "timings", None)
+               or getattr(chunk, "timing", None))
+    if not isinstance(timings, dict):
+        return {}
+    return {
+        "server_prompt_eval_seconds": ms_to_seconds(
+            timings.get("prompt_ms") or timings.get("prompt_eval_ms")),
+        "server_generation_seconds": ms_to_seconds(
+            timings.get("predicted_ms") or timings.get("generation_ms")
+            or timings.get("eval_ms")),
+        "server_tps": to_float(
+            timings.get("predicted_per_second")
+            or timings.get("tokens_per_second")),
+    }
+
+
+def _run_openai_stream(url: str, model: str, prompt: str,
+                       conf: OpenAIConfig,
+                       *, timeout: int, thinking: bool) -> dict:
+    """Open ONE streaming chat/completions request, drain every chunk,
+    and return all the per-prompt metrics the benchmark needs.
+
+    Returned dict carries:
+      - wall, ttft, thinking_ttft (None when not observed)
+      - eval_dur (client-side decode duration proxy)
+      - eval_count, prompt_tokens, total_tokens, tokens_estimated
+      - answer (joined `delta.content` text)
+      - server_timings (dict; empty when no `timings` block was emitted)
+    """
+    client = _make_openai_client(url, conf, timeout=timeout)
+    kwargs, is_chat = _build_stream_kwargs(model, prompt, conf,
+                                          thinking=thinking)
+
+    started = time.perf_counter()
+    first_thinking_at: float | None = None
+    first_content_at: float | None = None
+    last_content_at: float | None = None
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    usage = None
+    server_timings: dict = {}
+
+    api = (client.chat.completions.create if is_chat
+           else client.completions.create)
+    stream = api(**kwargs)
+    try:
+        for chunk in stream:
+            now = time.perf_counter() - started
+
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                usage = chunk_usage
+
+            timings = _extract_server_timings(chunk)
+            if timings:
+                server_timings = timings
+
+            if is_chat:
+                reasoning, content = _extract_chat_deltas(chunk)
+            else:
+                reasoning = None
+                content = _extract_completion_text(chunk)
+
+            if reasoning and isinstance(reasoning, str) and reasoning.strip():
+                if first_thinking_at is None:
+                    first_thinking_at = now
+                reasoning_parts.append(reasoning)
+            if content and isinstance(content, str) and content.strip():
+                if first_content_at is None:
+                    first_content_at = now
+                last_content_at = now
+                content_parts.append(content)
+            elif content:
+                # Non-empty but whitespace-only — accumulate text but do
+                # NOT advance the TTFT clock (matches the Ollama behavior
+                # of filtering whitespace-only leading chunks).
+                content_parts.append(content)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+    wall = time.perf_counter() - started
+    answer = "".join(content_parts)
+
+    if (first_content_at is not None and last_content_at is not None
+            and last_content_at > first_content_at):
+        eval_dur = last_content_at - first_content_at
+    elif first_content_at is not None and wall > first_content_at:
+        # Single content chunk (or all tokens emitted in one batch):
+        # fall back to "wall minus prefill" so eval_dur stays positive.
+        eval_dur = wall - first_content_at
+    else:
+        eval_dur = 0.0
+
+    eval_count: int | None = None
+    prompt_tokens = 0
+    total_tokens: int | None = None
+    if usage is not None:
+        eval_count = getattr(usage, "completion_tokens", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        total_tokens = getattr(usage, "total_tokens", None)
+
+    estimated = False
+    if eval_count is None:
+        eval_count = rough_token_count(answer)
+        estimated = True
+    eval_count = int(eval_count or 0)
+    if total_tokens is None and prompt_tokens and eval_count:
+        total_tokens = prompt_tokens + eval_count
+
+    return {
+        "wall": wall,
+        "ttft": first_content_at,
+        "thinking_ttft": first_thinking_at,
+        "eval_dur": eval_dur,
+        "eval_count": eval_count,
+        "prompt_tokens": prompt_tokens,
+        "total_tokens": int(total_tokens or 0),
+        "answer": answer,
+        "estimated": estimated,
+        "server_timings": server_timings,
+    }
 
 
 def benchmark_prompt_openai(url: str, model: str, prompt: str,
@@ -294,106 +337,69 @@ def benchmark_prompt_openai(url: str, model: str, prompt: str,
                             *, request_timeout: int,
                             thinking: bool = False,
                             ) -> QuestionResult:
-    """OpenAI-compatible benchmark for vLLM / llama.cpp / other oai-compat
-    backends. See QuestionResult docstring for stream=false field semantics.
+    """OpenAI-compatible benchmark for vLLM / llama.cpp / oai-compat
+    backends. ONE streaming request per prompt — see this module's
+    docstring for the metric coordinate system.
 
-    `thinking` is the per-model `spec.thinking` config flag echoed straight
-    onto `QuestionResult.has_thinking`. When True, an extra streaming probe
-    runs with `extra_body={"chat_template_kwargs": {"thinking": True}}` and
-    fills `thinking_ttft_seconds` from the first reasoning delta (the same
-    probe also gives a real `ttft_seconds` from the first content delta,
-    so it REPLACES the max_tokens=1 ping for thinking models). When False,
-    only the classic max_tokens=1 probe runs and `thinking_ttft_seconds`
-    is left at 0 (rendered as `—` in the email).
+    `thinking` is echoed onto `QuestionResult.has_thinking`. When True,
+    the request carries `extra_body={"chat_template_kwargs":
+    {"thinking": True}}` so vLLM / Qwen3 / DeepSeek-R1 chat templates
+    emit a reasoning delta we can time.
     """
-    full = openai_url(url, conf.endpoint)
-    headers = openai_headers(conf.api_key, conf.extra_headers)
-
-    ttft_approx: float | None = None
-    thinking_ttft: float | None = None
-
-    if thinking and conf.measure_ttft_approx:
-        # One streaming probe captures BOTH ttft and thinking_ttft.
-        thinking_ttft, ttft_approx = _measure_openai_streaming_ttfts(
-            url, model, prompt, conf, timeout=request_timeout)
-        # Fall back to max_tokens=1 if the stream gave us nothing for
-        # ttft (e.g. the entrance dropped SSE).
-        if ttft_approx is None:
-            ttft_approx = _measure_openai_ttft(url, model, prompt, conf,
-                                               timeout=request_timeout)
-    elif conf.measure_ttft_approx:
-        ttft_approx = _measure_openai_ttft(url, model, prompt, conf,
-                                           timeout=request_timeout)
-
-    payload = build_openai_payload(model, prompt, conf)
-    started = time.perf_counter()
     try:
-        wall, body = post_openai(full, payload, headers,
-                                 timeout=request_timeout)
+        result = _run_openai_stream(
+            url, model, prompt, conf,
+            timeout=request_timeout, thinking=thinking)
     except Exception as exc:
         msg = str(exc)
         hint = auth_hint(exc)
         if hint:
             msg = f"{msg} ({hint})"
-        ttft_val = round(ttft_approx, 3) if ttft_approx else 0.0
-        think_val = (round(thinking_ttft, 3)
-                     if thinking_ttft is not None else 0.0)
         return QuestionResult(
-            prompt=prompt, ok=False, error=msg,
-            wall_seconds=round(time.perf_counter() - started, 3),
-            ttft_seconds=ttft_val,
-            thinking_ttft_seconds=think_val,
+            prompt=prompt,
+            ok=False,
+            error=msg,
+            wall_seconds=0.0,
             has_thinking=thinking,
         )
 
-    parsed = _extract_openai_response(body)
-    answer = parsed["answer"]
-    completion = parsed["completion_tokens"]
-    estimated = False
-    if completion is None:
-        completion = rough_token_count(answer)
-        estimated = True
-    prompt_tokens = parsed["prompt_tokens"] or 0
-    total_tokens = parsed["total_tokens"]
-    if total_tokens is None and prompt_tokens and completion:
-        total_tokens = prompt_tokens + completion
+    wall = result["wall"]
+    eval_dur = result["eval_dur"]
+    eval_count = result["eval_count"]
+    answer = result["answer"]
 
-    server_gen = parsed["server_generation_seconds"]
-    server_tps_reported = parsed["server_tps"]
-    # Prefer the real server TPS when llama.cpp gives it to us, else fall
-    # back to client end-to-end (the only honest number vLLM exposes
-    # under stream=false).
-    client_tps = (completion / wall) if wall > 0 and completion else 0.0
-    if server_tps_reported and server_tps_reported > 0:
-        chosen_tps = server_tps_reported
-    elif server_gen and server_gen > 0 and completion:
-        chosen_tps = completion / server_gen
-    else:
-        chosen_tps = client_tps
+    ttft_val = (round(result["ttft"], 3)
+                if result["ttft"] is not None else 0.0)
+    think_val = (round(result["thinking_ttft"], 3)
+                 if result["thinking_ttft"] is not None else 0.0)
 
-    notes: list = []
-    if ttft_approx is None and conf.measure_ttft_approx:
-        notes.append("ttft probe failed; ttft_seconds=0")
-    elif thinking and thinking_ttft is not None:
-        notes.append("ttft_seconds and thinking_ttft_seconds captured via "
-                     "stream=true with chat_template_kwargs.thinking=true "
-                     "(first content delta / first reasoning delta)")
-    elif thinking and thinking_ttft is None:
-        notes.append("spec.thinking=true but no reasoning delta observed; "
-                     "thinking_ttft_seconds=0")
-    elif ttft_approx is not None:
-        notes.append("ttft_seconds is APPROX (max_tokens=1 round-trip; "
-                     "TRUE TTFT needs stream=true)")
-    if not (server_tps_reported and server_tps_reported > 0) and \
-       not (server_gen and server_gen > 0):
-        notes.append("no server-side `timings` block; tps = client end-to-end "
-                     "(includes prefill+decode+network)")
-    if estimated:
-        notes.append("usage missing; eval_count is a char-count estimate")
+    decode_tps = (eval_count / eval_dur) if eval_dur > 0 else 0.0
+    client_tps = (eval_count / wall) if wall > 0 and eval_count else 0.0
 
-    ttft_val = round(ttft_approx, 3) if ttft_approx else 0.0
-    think_val = (round(thinking_ttft, 3)
-                 if thinking_ttft is not None else 0.0)
+    server_timings = result["server_timings"]
+    server_gen = float(server_timings.get("server_generation_seconds") or 0.0)
+    server_prompt_eval = float(
+        server_timings.get("server_prompt_eval_seconds") or 0.0)
+    server_tps_reported = float(server_timings.get("server_tps") or 0.0)
+
+    notes: list[str] = []
+    notes.append("ttft / thinking_ttft from first delta of the streaming "
+                 "main request (no separate probe).")
+    notes.append("tps = eval_count / eval_seconds where eval_seconds is "
+                 "the client-observed decode window "
+                 "(last_content_delta - first_content_delta). "
+                 "client_tps = eval_count / wall is kept for diagnostics.")
+    if not server_timings:
+        notes.append("server `timings` block absent (vLLM); "
+                     "prompt_eval_seconds / server_tps_reported = 0.")
+    if result["estimated"]:
+        notes.append("server skipped the final usage chunk; eval_count is "
+                     "a char-count estimate (rough_token_count).")
+    if (result["ttft"] is None
+            and result["thinking_ttft"] is None
+            and eval_count == 0):
+        notes.append("stream completed but emitted no content / reasoning "
+                     "deltas — server may have returned an empty answer.")
 
     return QuestionResult(
         prompt=prompt,
@@ -404,16 +410,15 @@ def benchmark_prompt_openai(url: str, model: str, prompt: str,
         thinking_ttft_seconds=think_val,
         has_thinking=thinking,
         load_seconds=0.0,
-        prompt_eval_seconds=round(parsed["server_prompt_eval_seconds"], 3),
-        eval_count=int(completion or 0),
-        eval_seconds=round(server_gen, 3),
-        tps=round(chosen_tps, 2),
+        prompt_eval_seconds=round(server_prompt_eval, 3),
+        eval_count=eval_count,
+        eval_seconds=round(eval_dur, 3),
+        tps=round(decode_tps, 2),
         total_server_seconds=round(wall, 3),
-        prompt_tokens=prompt_tokens,
-        total_tokens=int(total_tokens or 0),
+        prompt_tokens=result["prompt_tokens"],
+        total_tokens=result["total_tokens"],
         client_tps=round(client_tps, 2),
-        server_tps_reported=round(server_tps_reported, 2)
-            if server_tps_reported else 0.0,
-        tokens_estimated=estimated,
+        server_tps_reported=round(server_tps_reported, 2),
+        tokens_estimated=result["estimated"],
         note="; ".join(notes),
     )

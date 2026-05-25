@@ -22,36 +22,63 @@ from llm_bench.domain.enums import ApiType, InstallDecision
 class QuestionResult:
     """Per-prompt timing record. Field semantics differ between backends:
 
+    Canonical metric definitions (consistent across BOTH backends so
+    rows can be read without knowing which API served them):
+      - wall_seconds : client wall clock from request → final chunk.
+                       For Ollama this is `urlopen` to the `done:true`
+                       chunk; for OpenAI-compatible this is `urlopen`
+                       to the last streamed chunk (stream=true).
+      - eval_count   : number of tokens in the response.
+                       Ollama: server-reported `eval_count`.
+                       OpenAI: `usage.completion_tokens` from the
+                       final usage-only chunk (vLLM / llama.cpp emit
+                       this when `stream_options.include_usage=true`),
+                       falling back to `rough_token_count(answer)`
+                       with `tokens_estimated=True`.
+      - eval_seconds : decode duration.
+                       Ollama: server-reported `eval_duration`.
+                       OpenAI: client-observed
+                       `last_content_delta_at - first_content_delta_at`
+                       (falls back to `wall - ttft` for single-chunk
+                       responses).
+      - tps          : `eval_count / eval_seconds` — decode-only
+                       throughput. Excludes prefill and streaming I/O.
+      - client_tps   : `eval_count / wall_seconds` — wall-clock
+                       throughput. Kept for diagnostics so operators
+                       can see the prefill + network overhead delta.
+
       ollama (/api/generate, stream=true — see core/benchmark/ollama.py)
-        - ttft_seconds        : client-observed wall-clock to the FIRST
+        - ttft_seconds        : client wall-clock to the FIRST
                                 non-empty visible response chunk
                                 (whitespace-only chunks filtered).
-                                Always measured.
-        - thinking_ttft_seconds: client-observed wall-clock to the FIRST
+        - thinking_ttft_seconds: client wall-clock to the FIRST
                                 non-empty thinking chunk; populated
                                 only when the runtime probe said the
                                 model supports thinking AND the model
                                 actually emitted a thinking chunk.
         - load_seconds /
           prompt_eval_seconds : server-side aggregate timings from the
-                                final done:true chunk. Diagnostic
-                                only — NOT used as TTFT (would
-                                understate user-visible TTFT for
-                                thinking models).
-        - eval_seconds        : decode duration (server)
-        - tps                 : decode tokens / decode seconds (server)
-        - total_server_seconds: total_duration (server)
+                                final done:true chunk. Diagnostic.
+        - total_server_seconds: server's `total_duration`.
 
-      openai-compatible (/v1/chat/completions, stream=false)
-        - ttft_seconds        : APPROX. round-trip of a separate
-                                max_tokens=1 request; 0 if disabled
-        - eval_seconds        : llama.cpp's `timings.predicted_ms` if
-                                returned by the server, else 0
-        - tps                 : server tps if `timings` available,
-                                else client_tps (eval_count / wall)
-        - total_server_seconds: equals wall_seconds
-        - prompt_tokens / total_tokens / client_tps / server_tps_reported
-          are populated from `usage` and `timings` blocks
+      openai-compatible (/v1/chat/completions, stream=true)
+        - ttft_seconds        : client wall-clock to the FIRST non-empty
+                                `delta.content` chunk. Real TTFT.
+        - thinking_ttft_seconds: client wall-clock to the FIRST
+                                non-empty `delta.reasoning` /
+                                `delta.reasoning_content` chunk.
+                                Populated only when the per-model
+                                `spec.thinking=true` flag is set AND the
+                                model actually emitted a reasoning delta.
+        - prompt_eval_seconds : llama.cpp's `timings.prompt_ms` when
+                                the server emits a `timings` block on
+                                the stream; 0 for vLLM. Diagnostic.
+        - total_server_seconds: equals wall_seconds.
+        - prompt_tokens / total_tokens / server_tps_reported are
+          populated from `usage` (final chunk) and `timings` (final
+          chunk). `server_tps_reported` is the server's self-reported
+          decode tokens/s — diagnostic only; the headline `tps` always
+          uses the client-observed eval_seconds denominator above.
 
     Thinking (DeepSeek-R1 / Qwen3 / GPT-OSS / o1-style):
       - For ollama, both `ttft_seconds` and `thinking_ttft_seconds`

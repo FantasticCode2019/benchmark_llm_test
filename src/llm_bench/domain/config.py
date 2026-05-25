@@ -150,6 +150,11 @@ class GlobalDefaults:
     save_pod_logs_on_failure: bool = True
     pod_logs_dir: str = "/tmp"
     api_type: ApiType = ApiType.OLLAMA
+    # Maps to ``olares-cli market install -s <name>`` (the chart source
+    # registry, e.g. "market.olares"). ``None`` / "" omits the flag so
+    # the CLI uses its built-in default source — keeps byte-for-byte
+    # behaviour for configs that don't opt in.
+    market_source: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> GlobalDefaults:
@@ -220,6 +225,10 @@ class GlobalDefaults:
             pod_logs_dir=str(raw.get("pod_logs_dir") or base.pod_logs_dir),
             api_type=ApiType.parse(raw.get("api_type"),
                                    default=base.api_type),
+            # `or None` collapses empty strings to "use CLI default" so
+            # operators can blank the field without deleting the key.
+            market_source=(str(raw["market_source"]).strip() or None
+                           if raw.get("market_source") else None),
         )
 
 
@@ -260,6 +269,10 @@ class ModelSpec:
     thinking: bool | None = None
     save_pod_logs_on_failure: bool | None = None
     pod_logs_dir: str | None = None
+    # Per-model override for the ``market install -s <name>`` flag.
+    # None means "inherit from GlobalDefaults.market_source" — set an
+    # empty string here to explicitly opt OUT of an inherited source.
+    market_source: str | None = None
     openai_overrides: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -333,6 +346,15 @@ class ModelSpec:
                 field_name=f"models[{app_name}].save_pod_logs_on_failure"),
             pod_logs_dir=(str(raw["pod_logs_dir"])
                           if raw.get("pod_logs_dir") else None),
+            # Per-model market source override. ``"market_source": ""``
+            # is an EXPLICIT opt-out (empty string passes through to
+            # ResolvedOptions and collapses to None there, blocking
+            # inheritance from the global default). Omitting the key
+            # entirely keeps inheritance live.
+            market_source=(str(raw["market_source"])
+                           if "market_source" in raw
+                           and raw["market_source"] is not None
+                           else None),
             openai_overrides=dict(openai_block),
         )
 
@@ -365,6 +387,10 @@ class ResolvedOptions:
     save_pod_logs: bool
     pod_logs_dir: str
     api_type: ApiType
+    # Resolved ``-s <name>`` value for ``olares-cli market install``.
+    # ``None`` means "let the CLI use its built-in default source" and
+    # ``ensure_installed`` omits the flag entirely in that case.
+    market_source: str | None
 
     @classmethod
     def for_model(cls, spec: ModelSpec,
@@ -410,6 +436,13 @@ class ResolvedOptions:
                                      defaults.save_pod_logs_on_failure),
             pod_logs_dir=_first_set(spec.pod_logs_dir, defaults.pod_logs_dir),
             api_type=_first_set(spec.api_type, defaults.api_type),
+            # spec.market_source is None when the key was omitted; an
+            # explicit empty string is preserved by _first_set (treated
+            # as set), then collapsed to None below so the CLI omits
+            # the -s flag. This is how a per-model spec opts OUT of a
+            # globally configured default source.
+            market_source=(_first_set(spec.market_source,
+                                      defaults.market_source) or None),
         )
 
 
@@ -493,6 +526,7 @@ _KNOWN_ROOT_KEYS = frozenset({
     "set_public_during_run", "skip_install_if_running",
     "preserve_if_existed", "uninstall_after_run", "thinking",
     "save_pod_logs_on_failure", "pod_logs_dir", "api_type",
+    "market_source",
     # Root-only
     "cli_path", "cooldown_seconds", "output_dir", "sudo_password",
     "openai_defaults", "models", "questions", "email",

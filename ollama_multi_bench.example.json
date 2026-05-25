@@ -8,6 +8,7 @@
   "skip_install_if_running": true,
   "delete_data": true,
   "uninstall_after": true,
+  "market_source": "market.olares",
   "models": [
     {
       "app_name": "ollamadeepseekr18b",

@@ -20,12 +20,22 @@ Metrics emitted:
 
   * Server aggregate stats — ``load_seconds``,
     ``prompt_eval_seconds``, ``eval_count``, ``eval_seconds``,
-    ``tps``, ``total_server_seconds`` — are decoded from the final
+    ``total_server_seconds`` — are decoded from the final
     ``done:true`` chunk and stored on the :class:`QuestionResult` for
     diagnostics. They are NOT used as TTFT: for a thinking model
     ``load_duration + prompt_eval_duration`` would understate the
     user-visible TTFT because it ignores the time the model spends
     emitting the hidden reasoning trace.
+
+  * ``tps`` — **decode-only** generated-tokens-per-second
+    (``eval_count / eval_duration``). This isolates raw decode
+    throughput from prefill and streaming I/O so the number is a
+    pure "how fast the model emits tokens once it starts" reading.
+    The server's ``eval_duration`` is authoritative — it counts
+    nanoseconds spent in the decode loop on the GPU. Wall-clock
+    throughput (``eval_count / wall_seconds``) is exposed
+    separately on the per-prompt log line as ``client_tps`` for
+    diagnostics, but is NOT the headline ``tps``.
 
 Both TTFTs share the same ``time.perf_counter()`` epoch (captured
 immediately BEFORE ``urllib.request.urlopen``), so they're directly
@@ -205,16 +215,21 @@ def benchmark_prompt_ollama(
 
     server_prefill_seconds = round(load + prompt_eval, 3)
 
+    client_tps = (eval_count / wall) if wall > 0 and eval_count else 0.0
+
     log.info(
         "ollama benchmark_prompt_ollama report durations: "
         "load=%.3fs prompt_eval=%.3fs server_prefill=%.3fs "
-        "eval_count=%d eval_dur=%.3fs total=%.3fs",
+        "eval_count=%d eval_dur=%.3fs total=%.3fs "
+        "wall=%.3fs client_tps=%.2f",
         load,
         prompt_eval,
         server_prefill_seconds,
         eval_count,
         eval_dur,
         total,
+        wall,
+        client_tps,
     )
 
     # Client-observed visible TTFT. For thinking models, this includes the time
@@ -276,6 +291,10 @@ def benchmark_prompt_ollama(
         prompt_eval_seconds=round(prompt_eval, 3),
         eval_count=eval_count,
         eval_seconds=round(eval_dur, 3),
+        # Decode-only throughput: tokens emitted by the server divided
+        # by the server's reported decode duration (`eval_duration`).
+        # Isolates raw model speed from prefill + streaming I/O.
         tps=round(eval_count / eval_dur, 2) if eval_dur > 0 else 0.0,
+        client_tps=round(client_tps, 2),
         total_server_seconds=round(total, 3),
     )

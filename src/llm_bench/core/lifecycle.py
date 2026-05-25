@@ -123,13 +123,21 @@ def _parse_install_status(raw: str | None) -> dict | None:
 
 
 def market_install(app: str, *, watch_minutes: int,
-                   envs: list | None = None) -> dict | None:
+                   envs: list | None = None,
+                   market_source: str | None = None) -> dict | None:
     """Run ``olares-cli market install <app> --watch -o json``.
 
     No default ``--env`` flags are injected. Whatever the caller
     passes via ``envs`` is forwarded as-is after passing through
     :func:`_merge_install_envs` (key-based dedup, non-KEY=VALUE
     passthrough, non-string drop).
+
+    ``market_source`` maps to the CLI's ``-s <name>`` flag, which
+    selects the source registry the chart is pulled from (e.g.
+    ``market.olares``). ``None`` / empty leaves the flag off so the
+    CLI uses its built-in default source — preserves byte-for-byte
+    behaviour for configs that don't opt in. The value is forwarded
+    verbatim; the CLI handles its own quoting.
 
     Returns:
         The parsed JSON status dict on success — typically
@@ -151,6 +159,11 @@ def market_install(app: str, *, watch_minutes: int,
     """
     cmd = [cli(), "market", "install", app, "-o", "json",
            "--watch", "--watch-timeout", f"{watch_minutes}m"]
+    # Source flag goes BEFORE --env so the CLI's argparse sees it as
+    # an install-command flag, not as an --env payload. Order between
+    # -s and the other install flags is otherwise irrelevant.
+    if market_source:
+        cmd.extend(["-s", market_source])
     for kv in _merge_install_envs(envs):
         cmd.extend(["--env", kv])
     proc = run(cmd, timeout=watch_minutes * 60 + 60,
@@ -226,8 +239,15 @@ def market_status_watch(app: str, *, watch_minutes: int) -> None:
 def ensure_installed(app: str, *, install_minutes: int,
                      uninstall_minutes: int, install_envs: list[str],
                      delete_data: bool, skip_if_running: bool,
+                     market_source: str | None = None,
                      ) -> tuple[bool, InstallDecision, dict | None]:
     """Make sure the app is ``running`` before benchmarking.
+
+    ``market_source`` is forwarded verbatim to every ``market_install``
+    call (FRESH + RECOVERED paths) as the CLI's ``-s <name>`` flag.
+    ``None`` / empty omits the flag so the CLI uses its built-in
+    default source. The REUSED path issues no install command, so the
+    flag has no effect there — the app is already running.
 
     Returns ``(already_existed, decision, install_status)``:
 
@@ -247,7 +267,8 @@ def ensure_installed(app: str, *, install_minutes: int,
     if row is None:
         log.info("%s not installed, installing...", app)
         status = market_install(
-            app, watch_minutes=install_minutes, envs=install_envs)
+            app, watch_minutes=install_minutes, envs=install_envs,
+            market_source=market_source)
         return (False, InstallDecision.FRESH, status)
 
     state = (row.get("state") or "").strip()
@@ -274,7 +295,8 @@ def ensure_installed(app: str, *, install_minutes: int,
                  "(no uninstall needed: helm release already gone)",
                  app, state)
         status = market_install(
-            app, watch_minutes=install_minutes, envs=install_envs)
+            app, watch_minutes=install_minutes, envs=install_envs,
+            market_source=market_source)
         return (False, InstallDecision.RECOVERED, status)
 
     log.warning("%s in non-running state (%s); uninstall + reinstall", app, state)
@@ -284,7 +306,8 @@ def ensure_installed(app: str, *, install_minutes: int,
     except Exception as exc:  # pre-install uninstall is best-effort
         log.warning("pre-install uninstall failed (continuing): %s", exc)
     status = market_install(
-        app, watch_minutes=install_minutes, envs=install_envs)
+        app, watch_minutes=install_minutes, envs=install_envs,
+        market_source=market_source)
     return (False, InstallDecision.RECOVERED, status)
 
 

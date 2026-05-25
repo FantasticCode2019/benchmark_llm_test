@@ -145,6 +145,7 @@ def _model_row(r: ModelResult, prompt_idx: int, *, bg: str) -> str:
         tps = _EMPTY
         tokens = _EMPTY
         wall = _EMPTY
+        load = _EMPTY
         badge = _fail_badge(r.error or "did not reach this prompt")
     elif qr.ok:
         ttft_think = (f"{qr.thinking_ttft_seconds:.2f}"
@@ -153,6 +154,12 @@ def _model_row(r: ModelResult, prompt_idx: int, *, bg: str) -> str:
         tps = f"{qr.tps:.1f}"
         tokens = f"{qr.eval_count:d}"
         wall = f"{qr.wall_seconds:.2f}"
+        # OpenAI rows leave `load_seconds=0` because the backend has no
+        # equivalent of Ollama's disk→VRAM load_duration. Render those
+        # as an em-dash so the cell visually disambiguates "no concept"
+        # from "warm reuse, ~0s".
+        load = (f"{qr.load_seconds:.2f}"
+                if qr.load_seconds else _EMPTY)
         badge = _OK_BADGE
     else:
         # Prompt was attempted but errored — surface the per-prompt
@@ -163,6 +170,7 @@ def _model_row(r: ModelResult, prompt_idx: int, *, bg: str) -> str:
         tps = _EMPTY
         tokens = _EMPTY
         wall = _EMPTY
+        load = _EMPTY
         badge = _fail_badge(qr.error or r.error or "prompt failed")
 
     return (
@@ -184,6 +192,7 @@ def _model_row(r: ModelResult, prompt_idx: int, *, bg: str) -> str:
         f'<td style="{_CELL_R};font-weight:600;color:#0b5fff">{tps}</td>'
         f'<td style="{_CELL_R}">{tokens}</td>'
         f'<td style="{_CELL_R}">{wall}</td>'
+        f'<td style="{_CELL_R}">{load}</td>'
         f'<td style="{_CELL_C}">{badge}</td>'
         '</tr>'
     )
@@ -228,6 +237,7 @@ def _prompt_section(results: list[ModelResult], prompt_idx: int,
         f'<th style="{_TH_R}">TPS</th>'
         f'<th style="{_TH_R}">Tokens</th>'
         f'<th style="{_TH_R}">Wall (s)</th>'
+        f'<th style="{_TH_R}">Load (s)</th>'
         f'<th style="{_TH_C}">Status</th>'
         '</tr></thead><tbody>'
         + "".join(rows) +
@@ -307,18 +317,39 @@ def _footer_legend() -> str:
         'thinking phase or the streaming probe failed &middot; '
         '<b>TTFT</b> = time to the first ANSWER token (after thinking, '
         'if any) &middot; '
-        '<b>TPS</b> = generated tokens per second &middot; '
+        '<b>Wall</b> = client-side request &rarr; final-chunk wall '
+        'clock (stream=true for both backends) &middot; '
         '<b>Tokens</b> = generated tokens for this prompt &middot; '
-        '<b>Wall</b> = client-side request &rarr; response. '
-        'For Ollama these come from server-reported '
+        '<b>TPS</b> = Tokens / eval_seconds (decode-only throughput, '
+        'same denominator across Ollama and OpenAI-compatible backends '
+        'so rows are directly comparable) &middot; '
+        '<b>Load</b> = Ollama server-side '
         '<code style="background:#f3f4f6;padding:0 4px;'
-        'border-radius:3px">load/prompt_eval/eval</code> durations; '
-        'for vLLM / llama.cpp TTFT is taken from the first '
-        '<code>delta.content</code> of the streaming probe '
-        '(max_tokens=1 fallback) and TPS prefers llama.cpp '
+        'border-radius:3px">load_duration</code> (disk &rarr; VRAM '
+        'load before generation; ~0s on a warm-loaded model, seconds '
+        'on a cold first request). Shown as '
+        '<span style="color:#bbb">—</span> for OpenAI rows because '
+        'vLLM / llama.cpp expose no equivalent. '
+        'For Ollama, Wall covers the streaming '
         '<code style="background:#f3f4f6;padding:0 4px;'
-        'border-radius:3px">timings.predicted_per_second</code> '
-        'when present, else completion_tokens / wall. '
+        'border-radius:3px">/api/generate</code> request from '
+        '<code>urlopen</code> to the final '
+        '<code style="background:#f3f4f6;padding:0 4px;'
+        'border-radius:3px">done:true</code> chunk, Tokens is the '
+        'server-reported <code>eval_count</code>, and eval_seconds is '
+        'the server-reported <code>eval_duration</code>. '
+        'For vLLM / llama.cpp, Wall covers the streaming '
+        '<code>/v1/chat/completions</code> request '
+        '(<code>stream=true</code> + '
+        '<code>stream_options.include_usage=true</code>); Tokens is '
+        '<code>usage.completion_tokens</code> from the final usage '
+        'chunk (falling back to a char-based estimate, flagged in the '
+        'JSON); eval_seconds is the client-observed window from the '
+        'first <code>delta.content</code> to the last '
+        '<code>delta.content</code>. '
+        'Wall-clock throughput (<code>Tokens / Wall</code>) is kept '
+        'separately as <code>client_tps</code> in the JSON / Excel '
+        'attachments for diagnostics. '
         'API type, descriptor metadata, and per-prompt error text '
         'are preserved in the JSON / Excel attachments.'
         '</p>'

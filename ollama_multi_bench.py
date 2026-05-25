@@ -131,6 +131,11 @@ class BenchConfig:
     # Optional SMTP block. When None the script just prints the summary
     # to stdout; when populated, the same summary is also mailed.
     email: EmailConfig | None = None
+    # Maps to ``olares-cli market install -s <name>``. ``None`` /
+    # empty string leaves the flag off so the CLI uses its built-in
+    # default source (preserves the harness's historical behaviour
+    # for configs that haven't opted in).
+    market_source: str | None = None
 
     @classmethod
     def from_dict(cls, raw: Any) -> BenchConfig:
@@ -204,6 +209,7 @@ class BenchConfig:
             cli_path=_optional_str(raw, "cli_path"),
             log_file=_optional_str(raw, "log_file"),
             email=email_cfg,
+            market_source=_optional_str(raw, "market_source"),
         )
 
 
@@ -398,6 +404,7 @@ def _install_one(target: TargetModel, cfg: BenchConfig) -> InstallOutcome:
             install_envs=[],
             delete_data=cfg.delete_data,
             skip_if_running=cfg.skip_install_if_running,
+            market_source=cfg.market_source,
         )
         return InstallOutcome(
             target=target,

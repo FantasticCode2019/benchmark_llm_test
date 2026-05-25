@@ -129,6 +129,7 @@ def _step_install(ctx: BenchmarkContext) -> None:
         install_envs=list(ctx.spec.envs),
         delete_data=ctx.opts.delete_data,
         skip_if_running=ctx.opts.skip_if_running,
+        market_source=ctx.opts.market_source,
     )
     ctx.already_existed = already_existed
     ctx.result.install_decision = decision
