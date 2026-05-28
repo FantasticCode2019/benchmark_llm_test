@@ -50,7 +50,13 @@ from __future__ import annotations
 import logging
 import time
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
 
 from llm_bench.clients.openai_errors import auth_hint
 from llm_bench.constants import LOG_NAMESPACE
@@ -58,6 +64,59 @@ from llm_bench.domain import AppConfig, ModelSpec, OpenAIConfig, QuestionResult
 from llm_bench.utils.tokens import ms_to_seconds, rough_token_count, to_float
 
 log = logging.getLogger(LOG_NAMESPACE)
+
+# Default retry policy for transient network / upstream errors. Three total
+# attempts (one initial + two retries) lets us ride out a brief ingress
+# blip, a 502 from the vLLM frontend, or a single dropped TCP stream
+# without dragging a benchmark out indefinitely when the endpoint is
+# genuinely unreachable. Each retry runs a fresh `_attempt_once_openai`,
+# so wall_seconds / ttft_seconds / eval_seconds reflect ONLY the attempt
+# that finally succeeded — partial timings from a failed attempt are
+# intentionally discarded.
+_DEFAULT_MAX_ATTEMPTS = 3
+_DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
+
+# Exception types we treat as "retry this prompt". APIConnectionError
+# already covers APITimeoutError (it's a subclass); we list both for
+# clarity. InternalServerError catches 5xx (502 / 503 / 504 from the
+# ingress in front of vLLM); RateLimitError catches 429 bursts that
+# should subside on the next attempt.
+_RETRYABLE_OPENAI_EXC: tuple[type[Exception], ...] = (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
+
+
+def _is_retryable_openai_error(exc: BaseException) -> bool:
+    """True if ``exc`` is a transient network/server failure worth retrying.
+
+    Matches:
+
+      * ``openai.APIConnectionError`` (includes the SDK's literal
+        ``"Connection error."`` text raised when httpx loses the
+        connection mid-stream, the upstream resets the socket, DNS
+        fails, etc.).
+      * ``openai.APITimeoutError`` — explicit request timeout (subclass
+        of APIConnectionError, listed for clarity).
+      * ``openai.InternalServerError`` — 5xx from the upstream (vLLM
+        startup window, ingress gateway timeouts, ...).
+      * ``openai.RateLimitError`` — 429; the next attempt usually lands
+        outside the burst window.
+
+    Auth (401/403), bad-request (400), not-found (404) and similar
+    permanent errors are NOT covered here on purpose — retrying them
+    just delays the failure without changing the outcome.
+    """
+    if isinstance(exc, _RETRYABLE_OPENAI_EXC):
+        return True
+    # Defensive string fallback for environments where the SDK exception
+    # type is lost (e.g. wrapped by an instrumenting middleware): the
+    # SDK's "Connection error." text and generic "timed out" wording
+    # are the two signals we want to catch.
+    s = str(exc).lower()
+    return "connection error" in s or "timed out" in s
 
 
 def openai_config_from(spec: ModelSpec, cfg: AppConfig) -> OpenAIConfig:
@@ -332,25 +391,124 @@ def _run_openai_stream(url: str, model: str, prompt: str,
     }
 
 
+class _OpenAIRetryable(Exception):
+    """Internal signal: this attempt failed with a transient network /
+    upstream error and the outer loop should retry with a fresh timer
+    epoch. Carries ``wall_seconds`` so the retry log line can report
+    how long the failed attempt actually spent before giving up, and
+    so the final "all attempts exhausted" QuestionResult reflects the
+    last attempt's wall time instead of a hard-coded zero.
+    """
+
+    def __init__(self, msg: str, wall_seconds: float) -> None:
+        super().__init__(msg)
+        self.msg = msg
+        self.wall_seconds = wall_seconds
+
+
 def benchmark_prompt_openai(url: str, model: str, prompt: str,
                             conf: OpenAIConfig,
                             *, request_timeout: int,
                             thinking: bool = False,
+                            max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+                            retry_backoff_seconds: float = (
+                                _DEFAULT_RETRY_BACKOFF_SECONDS),
                             ) -> QuestionResult:
     """OpenAI-compatible benchmark for vLLM / llama.cpp / oai-compat
     backends. ONE streaming request per prompt — see this module's
     docstring for the metric coordinate system.
+
+    On transient network / upstream errors (``APIConnectionError``,
+    ``APITimeoutError``, ``InternalServerError``, ``RateLimitError``)
+    the request is retried up to ``max_attempts`` times (default
+    3 = one initial attempt plus two retries). Each retry runs a fresh
+    :func:`_attempt_once_openai`, which resets the
+    ``time.perf_counter()`` epoch inside :func:`_run_openai_stream`
+    and discards all chunk-tracking state from the failed attempt, so
+    the returned ``wall_seconds`` / ``ttft_seconds`` /
+    ``thinking_ttft_seconds`` / ``eval_seconds`` describe ONLY the
+    attempt that finally succeeded. Permanent errors (auth, 400, 404,
+    decode failures) are returned immediately without burning retry
+    budget.
 
     `thinking` is echoed onto `QuestionResult.has_thinking`. When True,
     the request carries `extra_body={"chat_template_kwargs":
     {"thinking": True}}` so vLLM / Qwen3 / DeepSeek-R1 chat templates
     emit a reasoning delta we can time.
     """
+    attempts = max(1, int(max_attempts))
+    last_msg = ""
+    last_wall = 0.0
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return _attempt_once_openai(
+                url, model, prompt, conf,
+                request_timeout=request_timeout,
+                thinking=thinking,
+            )
+        except _OpenAIRetryable as exc:
+            last_msg = exc.msg
+            last_wall = exc.wall_seconds
+            if attempt < attempts:
+                log.warning(
+                    "openai request failed (attempt %d/%d, "
+                    "wasted=%.3fs): %s -- retrying in %.1fs "
+                    "(timers will be reset)",
+                    attempt,
+                    attempts,
+                    exc.wall_seconds,
+                    exc.msg,
+                    retry_backoff_seconds,
+                )
+                if retry_backoff_seconds > 0:
+                    time.sleep(retry_backoff_seconds)
+            else:
+                log.warning(
+                    "openai request failed after %d attempts "
+                    "(last wasted=%.3fs): %s",
+                    attempts,
+                    exc.wall_seconds,
+                    exc.msg,
+                )
+
+    return QuestionResult(
+        prompt=prompt,
+        ok=False,
+        error=(
+            f"transient failure after {attempts} attempts: {last_msg}"
+            if last_msg
+            else f"transient failure after {attempts} attempts"
+        ),
+        wall_seconds=round(last_wall, 3),
+        has_thinking=thinking,
+    )
+
+
+def _attempt_once_openai(url: str, model: str, prompt: str,
+                         conf: OpenAIConfig,
+                         *, request_timeout: int,
+                         thinking: bool) -> QuestionResult:
+    """Single streaming attempt. Caller is responsible for retry policy.
+
+    Raises :class:`_OpenAIRetryable` on transient network / upstream
+    failures so the outer :func:`benchmark_prompt_openai` can retry
+    with a fresh timer epoch. Permanent failures (auth, 400, decode,
+    etc.) are still returned as ``ok=False`` :class:`QuestionResult`
+    instances so we don't burn retry budget on errors that won't
+    resolve themselves.
+    """
+    started = time.perf_counter()
     try:
         result = _run_openai_stream(
             url, model, prompt, conf,
             timeout=request_timeout, thinking=thinking)
     except Exception as exc:
+        wall_at_failure = time.perf_counter() - started
+
+        if _is_retryable_openai_error(exc):
+            raise _OpenAIRetryable(str(exc), wall_at_failure) from exc
+
         msg = str(exc)
         hint = auth_hint(exc)
         if hint:
@@ -359,7 +517,7 @@ def benchmark_prompt_openai(url: str, model: str, prompt: str,
             prompt=prompt,
             ok=False,
             error=msg,
-            wall_seconds=0.0,
+            wall_seconds=round(wall_at_failure, 3),
             has_thinking=thinking,
         )
 

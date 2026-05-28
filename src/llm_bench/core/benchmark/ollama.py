@@ -58,9 +58,14 @@ chat" gate.
 """
 from __future__ import annotations
 
+import errno
+import http.client
 import json
 import logging
+import socket
+import ssl
 import time
+import urllib.error
 import urllib.request
 
 from llm_bench.clients.openai_errors import auth_hint
@@ -68,6 +73,106 @@ from llm_bench.constants import LOG_NAMESPACE
 from llm_bench.domain import QuestionResult
 
 log = logging.getLogger(LOG_NAMESPACE)
+
+# Default retry policy for transient network / transport errors. Three total
+# attempts (one initial + two retries) is enough to ride out a brief network
+# blip, an upstream cold-start, or a single TLS connection that the load
+# balancer tore down mid-stream — without dragging a benchmark run out for
+# minutes when the endpoint is genuinely down. Each retry starts a fresh
+# timer epoch inside `_attempt_once_ollama`, so wall_seconds / ttft_seconds
+# reflect ONLY the successful attempt's timings — partial work from the
+# failed attempt is discarded.
+_DEFAULT_MAX_ATTEMPTS = 3
+_DEFAULT_RETRY_BACKOFF_SECONDS = 5.0
+
+# errno codes that signal a transient/recoverable transport condition.
+# Anything in this set means "the connection broke for an environmental
+# reason, not because our request was wrong" — retrying with a fresh
+# socket is the right move.
+_RETRYABLE_ERRNOS = frozenset({
+    errno.ETIMEDOUT,        # [Errno 110] Connection timed out (Linux)
+    errno.ECONNRESET,       # [Errno 104] Connection reset by peer
+    errno.ECONNREFUSED,     # [Errno 111] briefly-down upstream
+    errno.ECONNABORTED,     # local connection aborted
+    errno.EPIPE,             # Broken pipe — server closed mid-write
+    errno.ENETUNREACH,
+    errno.EHOSTUNREACH,
+    errno.ENETRESET,
+    errno.ENETDOWN,
+})
+
+# String fragments seen in the wild that indicate a retryable transport
+# problem when the underlying exception type is lost (e.g. wrapped by a
+# logging / proxy / TLS middleware that only preserved str(exc)).
+_RETRYABLE_SUBSTRINGS = (
+    "timed out",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "broken pipe",
+    "remote end closed",
+    "unexpected_eof",
+    "eof occurred",  # ssl.SSLEOFError stringifies as "EOF occurred in ..."
+)
+
+
+def _is_retryable_network_error(exc: BaseException) -> bool:
+    """True if ``exc`` is a transient network/transport failure worth retrying.
+
+    Covers the shapes we see in practice when talking to ollama through a
+    load balancer / ingress:
+
+      * Python-level read timeout — ``socket.timeout`` / ``TimeoutError``
+        raised by ``urlopen(timeout=...)`` when no bytes arrive in time.
+      * Kernel-level transport errors — ``OSError`` with one of the
+        ``errno`` codes in :data:`_RETRYABLE_ERRNOS` (ETIMEDOUT for the
+        Linux ``[Errno 110] Connection timed out`` form, ECONNRESET for
+        the "peer killed our socket" form, etc.).
+      * Python's :class:`ConnectionError` family — ``ConnectionResetError``,
+        ``ConnectionAbortedError``, ``BrokenPipeError``, ...
+      * TLS-layer failures — :class:`ssl.SSLError` and friends, including
+        ``SSLEOFError`` ("``[SSL: UNEXPECTED_EOF_WHILE_READING] EOF
+        occurred in violation of protocol``"), which happens when an
+        upstream / ingress drops the TLS connection mid-stream.
+      * HTTP-layer transport breakages — :class:`http.client.HTTPException`
+        and subclasses: ``RemoteDisconnected``, ``IncompleteRead``,
+        ``BadStatusLine``. Symptoms of a transport that died between
+        request and response.
+      * :class:`urllib.error.URLError` wrapping any of the above on its
+        ``reason`` attribute, which is how the streaming loop typically
+        surfaces these.
+
+    A defensive string fallback (:data:`_RETRYABLE_SUBSTRINGS`) catches
+    the same wording in environments where the underlying exception type
+    has been lost.
+
+    NOTE: :class:`urllib.error.HTTPError` (4xx / 5xx with a body) is a
+    subclass of ``URLError`` but is NOT considered retryable here — those
+    are application-level responses (auth, bad request, ...) and
+    retrying them just delays the failure.
+    """
+    # 4xx / 5xx are application-level responses; never retry.
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    if isinstance(exc, ConnectionError):
+        return True
+    if isinstance(exc, ssl.SSLError):
+        return True
+    if isinstance(exc, http.client.HTTPException):
+        return True
+    if isinstance(exc, OSError) and exc.errno in _RETRYABLE_ERRNOS:
+        return True
+    reason = getattr(exc, "reason", None)
+    if (
+        reason is not None
+        and reason is not exc
+        and isinstance(reason, BaseException)
+    ):
+        return _is_retryable_network_error(reason)
+    s = str(exc).lower()
+    return any(frag in s for frag in _RETRYABLE_SUBSTRINGS)
 
 
 def benchmark_prompt_ollama(
@@ -77,9 +182,24 @@ def benchmark_prompt_ollama(
     *,
     request_timeout: int,
     thinking: bool = False,
+    max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+    retry_backoff_seconds: float = _DEFAULT_RETRY_BACKOFF_SECONDS,
 ) -> QuestionResult:
     """One streaming /api/generate call. Returns client-observed TTFT
     plus aggregate server timings in a single request.
+
+    On transient network / transport errors (read timeouts, kernel-level
+    connect timeouts, connection resets, TLS ``SSLEOFError`` /
+    ``UNEXPECTED_EOF_WHILE_READING`` mid-stream, ``RemoteDisconnected``,
+    ...) the request is retried up to ``max_attempts`` times (default
+    3 = one initial attempt plus two retries). Each retry runs a fresh
+    :func:`_attempt_once_ollama`, which resets the
+    ``time.perf_counter()`` epoch and all chunk-tracking state, so the
+    returned ``wall_seconds`` / ``ttft_seconds`` /
+    ``thinking_ttft_seconds`` describe ONLY the attempt that finally
+    succeeded — partial timings from a failed attempt are intentionally
+    discarded. Permanent errors (auth failures, HTTP 4xx, JSON decode
+    errors, ...) are returned immediately without burning retry budget.
 
     Metric semantics:
 
@@ -103,6 +223,89 @@ def benchmark_prompt_ollama(
       aggregate timings. They are useful for diagnostics, but they should not be
       used as user-visible TTFT for thinking models, because the model may spend
       additional time generating hidden reasoning before emitting visible output.
+    """
+    attempts = max(1, int(max_attempts))
+    last_msg = ""
+    last_wall = 0.0
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return _attempt_once_ollama(
+                url,
+                model,
+                prompt,
+                request_timeout=request_timeout,
+                thinking=thinking,
+            )
+        except _OllamaRetryable as exc:
+            last_msg = exc.msg
+            last_wall = exc.wall_seconds
+            if attempt < attempts:
+                log.warning(
+                    "ollama request failed (attempt %d/%d, "
+                    "wasted=%.3fs): %s -- retrying in %.1fs "
+                    "(timers will be reset)",
+                    attempt,
+                    attempts,
+                    exc.wall_seconds,
+                    exc.msg,
+                    retry_backoff_seconds,
+                )
+                if retry_backoff_seconds > 0:
+                    time.sleep(retry_backoff_seconds)
+            else:
+                log.warning(
+                    "ollama request failed after %d attempts "
+                    "(last wasted=%.3fs): %s",
+                    attempts,
+                    exc.wall_seconds,
+                    exc.msg,
+                )
+
+    return QuestionResult(
+        prompt=prompt,
+        ok=False,
+        error=(
+            f"transient failure after {attempts} attempts: {last_msg}"
+            if last_msg
+            else f"transient failure after {attempts} attempts"
+        ),
+        wall_seconds=round(last_wall, 3),
+        has_thinking=thinking,
+    )
+
+
+class _OllamaRetryable(Exception):
+    """Internal signal: this attempt failed with a transient network /
+    transport error and the outer loop should retry with a fresh timer
+    epoch. Carries ``wall_seconds`` so the retry log line can show how
+    long the failed attempt actually spent waiting, and so the final
+    "all attempts exhausted" QuestionResult can report the last
+    attempt's wall time instead of a hard-coded zero.
+    """
+
+    def __init__(self, msg: str, wall_seconds: float) -> None:
+        super().__init__(msg)
+        self.msg = msg
+        self.wall_seconds = wall_seconds
+
+
+def _attempt_once_ollama(
+    url: str,
+    model: str,
+    prompt: str,
+    *,
+    request_timeout: int,
+    thinking: bool,
+) -> QuestionResult:
+    """Single streaming /api/generate attempt. Caller is responsible for
+    retry policy.
+
+    Raises :class:`_OllamaRetryable` on transient network/transport
+    errors so the outer ``benchmark_prompt_ollama`` can retry with a
+    fresh timer epoch. Permanent failures are still returned as
+    ``ok=False`` :class:`QuestionResult` instances (auth errors,
+    HTTP 4xx, etc. should not consume retry budget).
     """
     payload = {
         "model": model,
@@ -189,6 +392,15 @@ def benchmark_prompt_ollama(
                     break
 
     except Exception as exc:
+        wall_at_failure = time.perf_counter() - started
+
+        # Bubble transient transport errors up so the outer retry loop
+        # can restart with a fresh timer epoch. Everything else (auth,
+        # JSON decode, HTTP 4xx, ...) is terminal for this prompt —
+        # return a failed QuestionResult immediately.
+        if _is_retryable_network_error(exc):
+            raise _OllamaRetryable(str(exc), wall_at_failure) from exc
+
         msg = str(exc)
         hint = auth_hint(exc)
         if hint:
@@ -198,7 +410,7 @@ def benchmark_prompt_ollama(
             prompt=prompt,
             ok=False,
             error=msg,
-            wall_seconds=round(time.perf_counter() - started, 3),
+            wall_seconds=round(wall_at_failure, 3),
             has_thinking=thinking,
         )
 
