@@ -1,8 +1,27 @@
 """
-Ollama-specific helper: ONE streaming /api/generate call that captures
+Ollama-specific helper: ONE streaming /api/chat call that captures
 the client-observed time-to-first-chunk for two distinct phases
 (hidden thinking trace + visible response) plus the server's aggregate
 stats. No second probe required.
+
+The request body matches the canonical Ollama ``/api/chat`` shape::
+
+    POST {entrance_url}/api/chat
+    Content-Type: application/json
+
+    {
+      "model": "<model-id>",
+      "messages": [{"role": "user", "content": "<prompt>"}]
+    }
+
+``stream`` is omitted because ``/api/chat`` already defaults to
+streaming NDJSON. The ``thinking`` Python flag is still honored on
+the parsing side — when set, the loop watches for
+``message.thinking`` deltas and times them as
+``thinking_ttft_seconds`` — but the flag is NOT echoed into the wire
+payload, so the server is responsible for deciding whether to split
+the reasoning trace into a separate ``message.thinking`` channel
+(Ollama does this automatically for thinking-capable models).
 
 Metrics emitted:
 
@@ -55,6 +74,17 @@ startup, so this module no longer issues its own pull. Readiness is
 established by ``wait_until_api_ready`` watching ``/api/tags`` —
 identical to the launcher's own "Waiting for Ollama" → "Ready to
 chat" gate.
+
+Note on the "model unloaded mid-stream" failure mode: when ollama
+streams ``done:true`` but reports ``eval_count=0`` AND no non-empty
+visible response chunk ever arrived, the request is treated as a
+**failure** (``ok=False``). This is the signature of the model being
+evicted from VRAM (or never loading) while the HTTP stream still
+closes cleanly — server stats come back zeroed, the descriptor
+reports ``processor="not loaded"``, ``loaded=false``. Surfacing this
+as ``ok=False`` is what lets the orchestrator's finally-block reuse
+the existing :func:`archive_pod_logs` tar-gzip flow to capture the
+container logs for post-mortem; no separate packaging path is added.
 """
 from __future__ import annotations
 
@@ -185,7 +215,7 @@ def benchmark_prompt_ollama(
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     retry_backoff_seconds: float = _DEFAULT_RETRY_BACKOFF_SECONDS,
 ) -> QuestionResult:
-    """One streaming /api/generate call. Returns client-observed TTFT
+    """One streaming /api/chat call. Returns client-observed TTFT
     plus aggregate server timings in a single request.
 
     On transient network / transport errors (read timeouts, kernel-level
@@ -298,7 +328,7 @@ def _attempt_once_ollama(
     request_timeout: int,
     thinking: bool,
 ) -> QuestionResult:
-    """Single streaming /api/generate attempt. Caller is responsible for
+    """Single streaming /api/chat attempt. Caller is responsible for
     retry policy.
 
     Raises :class:`_OllamaRetryable` on transient network/transport
@@ -306,16 +336,23 @@ def _attempt_once_ollama(
     fresh timer epoch. Permanent failures are still returned as
     ``ok=False`` :class:`QuestionResult` instances (auth errors,
     HTTP 4xx, etc. should not consume retry budget).
+
+    Body shape mirrors the documented Ollama curl form exactly:
+    ``{"model": ..., "messages": [...]}``. We deliberately do NOT
+    set ``stream`` (``/api/chat`` defaults to streaming NDJSON) nor
+    ``think`` (the server decides whether to split the reasoning
+    trace into ``message.thinking`` based on the model's
+    capabilities). The Python ``thinking`` arg here only gates the
+    parsing-side timing of ``message.thinking`` deltas — it is never
+    forwarded into the wire payload.
     """
     payload = {
         "model": model,
-        "prompt": prompt,
-        "stream": True,
-        "think": bool(thinking),
+        "messages": [{"role": "user", "content": prompt}],
     }
 
     req = urllib.request.Request(
-        f"{url.rstrip('/')}/api/generate",
+        f"{url.rstrip('/')}/api/chat",
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
@@ -346,19 +383,20 @@ def _attempt_once_ollama(
                 if not isinstance(chunk, dict):
                     continue
 
-                # /api/generate exposes thinking/response at the top level;
-                # /api/chat nests them under message.{thinking, content}.
-                # Accept both shapes to avoid silently losing TTFT if a future
-                # caller switches from generate to chat.
+                # /api/chat nests the deltas under message.{thinking,
+                # content} — that's our primary path. The /api/generate
+                # form (top-level chunk.thinking / chunk.response) is
+                # still recognized as a fallback so a future caller can
+                # switch endpoints without losing TTFT measurement.
                 message = chunk.get("message") or {}
                 thinking_text = (
-                    chunk.get("thinking")
-                    or message.get("thinking")
+                    message.get("thinking")
+                    or chunk.get("thinking")
                     or ""
                 )
                 response_text = (
-                    chunk.get("response")
-                    or message.get("content")
+                    message.get("content")
+                    or chunk.get("response")
                     or ""
                 )
 
@@ -483,6 +521,54 @@ def _attempt_once_ollama(
         log.info(
             "ollama visible ttft: no non-empty response chunk emitted; "
             "leaving ttft=0"
+        )
+
+    # "Model unloaded / never generated" detection.
+    #
+    # When the server streams `done:true` but reports eval_count=0 AND we
+    # never saw a non-empty visible response chunk, the model effectively
+    # produced nothing. In practice this is the unload-mid-stream pattern:
+    # ollama dropped the model from VRAM (cold-eviction, context-size
+    # mismatch, OOM preemption, ...) and closed the stream cleanly with
+    # zeroed server stats. Symptom seen in the field:
+    #
+    #   load=0.000s prompt_eval=0.000s eval_count=0 eval_dur=0.000s
+    #   total=0.000s wall=301.186s
+    #   ollama describe ...: "processor": "not loaded", "loaded": false
+    #
+    # We mark this attempt as ok=False so the orchestrator's finally-block
+    # archive step (`_step_archive_pod_logs`) — which keys off
+    # `any_prompt_ok` — naturally fires and tars `/var/log/pods/*<app>*`
+    # via the existing `archive_pod_logs` helper. No new packaging path
+    # is introduced; we simply route through the same tar.gz flow already
+    # used for hard failures.
+    if eval_count == 0 and first_response_at is None:
+        done_reason = final_chunk.get("done_reason") or ""
+        err = (
+            "ollama produced no output: eval_count=0 and no visible "
+            f"response chunk emitted (done_reason={done_reason!r}, "
+            f"server total={total:.3f}s, wall={wall:.3f}s). The model "
+            "likely unloaded mid-request or never loaded successfully; "
+            "pod logs will be archived by the orchestrator for "
+            "post-mortem."
+        )
+        log.warning("ollama %s", err)
+        return QuestionResult(
+            prompt=prompt,
+            ok=False,
+            error=err,
+            response_chars=sum(len(p) for p in response_parts),
+            wall_seconds=round(wall, 3),
+            ttft_seconds=ttft_seconds,
+            thinking_ttft_seconds=thinking_ttft_seconds,
+            has_thinking=thinking,
+            load_seconds=round(load, 3),
+            prompt_eval_seconds=round(prompt_eval, 3),
+            eval_count=eval_count,
+            eval_seconds=round(eval_dur, 3),
+            tps=0.0,
+            client_tps=round(client_tps, 2),
+            total_server_seconds=round(total, 3),
         )
 
     return QuestionResult(
