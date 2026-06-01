@@ -28,6 +28,11 @@ PROGRESSING_STATES = {
 }
 RECOVERABLE_STATES = {"stopped", "suspended"}
 
+# The app is already gone — its helm release has been torn down. Calling
+# `uninstall` again is wasteful and the state machine only allows InstallOp
+# from here, so a redundant uninstall would 400. Treat it as a no-op.
+UNINSTALLED_STATES = {"uninstalled"}
+
 # Helm release already gone (or never landed); state machine ONLY allows
 # InstallOp here — calling `uninstall` would 400. Skip it and go straight
 # to install. Source: `OperationAllowedInState` in
@@ -172,6 +177,7 @@ def market_install(app: str, *, watch_minutes: int,
     if proc.returncode != 0:
         # Surface a concise reason; include the parsed status so the
         # log line is useful even without the exception chain.
+        log.warning("market install %s exited %d: stdout=%s, stderr=%s", app, proc.returncode, proc.stdout, proc.stderr)
         reason: str
         if isinstance(status, dict):
             reason = (f"status={status.get('status')!r} "
@@ -189,28 +195,65 @@ def market_install(app: str, *, watch_minutes: int,
 
 
 def market_uninstall(app: str, *, watch_minutes: int = 30,
-                     delete_data: bool = True, cascade: bool = True) -> None:
+                     delete_data: bool = True, cascade: bool = True,
+                     market_source: str | None = None) -> None:
+    """Tear the chart down, but skip the call when it's already gone.
+
+    We first probe ``market status <app> -s <market_source> -o json``: if
+    the app reports ``"uninstalled"`` there's nothing to do, so we return
+    early instead of issuing a redundant (and potentially 400-ing)
+    uninstall. Any other state (``running``, ``stopped``, a failed state,
+    …) — or an unreadable status — falls through to the actual uninstall.
+
+    ``market_source`` is forwarded to the status probe as the CLI's
+    ``-s <name>`` flag so the probe reports a concrete state row rather
+    than a not-found error. ``None`` leaves the probe spanning all sources.
+    """
+    row = get_app_state(app, market_source=market_source)
+    if row is not None:
+        state = (row.get("state") or "").strip()
+        if state in UNINSTALLED_STATES:
+            log.info("%s already uninstalled (state=%r); skipping uninstall",
+                     app, state)
+            return
+        log.info("%s pre-uninstall state=%r; proceeding with uninstall",
+                 app, state)
     cmd = [cli(), "market", "uninstall", app,
            "--watch", "--watch-timeout", f"{watch_minutes}m"]
     if cascade:
         cmd.append("--cascade")
     if delete_data:
         cmd.append("--delete-data")
-    run(cmd, timeout=watch_minutes * 60 + 60)
+    r = run(cmd, timeout=watch_minutes * 60 + 60, capture=True, check=False)
+    if r.returncode != 0:
+        log.warning("market uninstall %s exited %d: stdout=%s, stderr=%s", app, r.returncode, r.stdout, r.stderr)
 
 
-def get_app_state(app: str) -> dict | None:
+def get_app_state(app: str, *, market_source: str | None = None) -> dict | None:
     """Returns the current statusRow dict, or None if the app isn't installed.
 
-    Wraps `olares-cli market status <app> -a -o json`. The CLI exits non-zero
-    when the app isn't installed, so we disable check= and treat both the
-    failure exit and an empty stdout as "not installed".
+    Wraps `olares-cli market status <app> -o json`. By default the query
+    spans all sources (`-a`); pass ``market_source`` to scope it to a
+    single source via the CLI's ``-s <name>`` flag (e.g.
+    ``market.olares``). Scoping to a source makes the CLI report a
+    concrete ``"uninstalled"`` row instead of exiting non-zero, which lets
+    callers distinguish "gone" from "never knew about it".
+
+    The CLI exits non-zero when the app isn't installed, so we disable
+    check= and treat both the failure exit and an empty stdout as "not
+    installed".
     """
+    cmd = [cli(), "market", "status", app, "-o", "json"]
+    if market_source:
+        cmd[4:4] = ["-s", market_source]
+    else:
+        cmd.insert(4, "-a")
     proc = subprocess.run(
-        [cli(), "market", "status", app, "-a", "-o", "json"],
-        capture_output=True, text=True, timeout=60, check=False,
+        cmd, capture_output=True, text=True, timeout=60, check=False,
     )
     if proc.returncode != 0:
+        log.warning("%s exited %d: stdout=%s, stderr=%s",
+                    " ".join(cmd), proc.returncode, proc.stdout, proc.stderr)
         return None
     out = proc.stdout.strip()
     if not out:
@@ -229,11 +272,14 @@ def get_app_state(app: str) -> dict | None:
 
 def market_status_watch(app: str, *, watch_minutes: int) -> None:
     """Block until the app reaches a terminal state (op-agnostic)."""
-    run(
+    r = run(
         [cli(), "market", "status", app,
          "--watch", "--watch-timeout", f"{watch_minutes}m"],
         timeout=watch_minutes * 60 + 60,
+        capture=True, check=False,
     )
+    if r.returncode != 0:
+        log.warning("market status %s --watch --watch-timeout %d exited %d: stdout=%s, stderr=%s", app, watch_minutes, r.returncode, r.stdout, r.stderr)
 
 
 def ensure_installed(app: str, *, install_minutes: int,
@@ -302,7 +348,8 @@ def ensure_installed(app: str, *, install_minutes: int,
     log.warning("%s in non-running state (%s); uninstall + reinstall", app, state)
     try:
         market_uninstall(app, watch_minutes=uninstall_minutes,
-                         delete_data=delete_data)
+                         delete_data=delete_data,
+                         market_source=market_source)
     except Exception as exc:  # pre-install uninstall is best-effort
         log.warning("pre-install uninstall failed (continuing): %s", exc)
     status = market_install(

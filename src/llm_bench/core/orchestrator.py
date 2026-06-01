@@ -422,7 +422,8 @@ def _step_uninstall(ctx: BenchmarkContext) -> None:
     try:
         t = time.perf_counter()
         market_uninstall(ctx.app, watch_minutes=ctx.opts.uninstall_minutes,
-                         delete_data=ctx.opts.delete_data)
+                         delete_data=ctx.opts.delete_data,
+                         market_source=ctx.opts.market_source)
         ctx.result.uninstall_seconds = round(time.perf_counter() - t, 1)
         ctx.result.uninstall_ok = True
     except Exception as exc:  # record + try one more log archive

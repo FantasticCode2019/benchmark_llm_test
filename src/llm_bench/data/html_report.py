@@ -79,6 +79,23 @@ def _question_for(result: ModelResult,
     return None
 
 
+def _display_model(r: ModelResult) -> str:
+    """Model id to show in the MODEL column.
+
+    For Ollama runs the backend echoes a ``model`` field on every
+    ``/api/chat`` chunk (captured into ``QuestionResult.server_model``);
+    we prefer the first non-empty one so the column reflects what the
+    server actually served (tag resolution, ``:latest`` expansion, ...).
+    Falls back to the configured ``result.model`` when no server value
+    was recorded (non-Ollama backend, or the request never streamed a
+    chunk).
+    """
+    for q in r.questions:
+        if q.server_model:
+            return q.server_model
+    return r.model
+
+
 def _fail_badge(error: str) -> str:
     """Red FAIL badge with the full error text as a tooltip."""
     return ('<span style="display:inline-block;padding:2px 9px;'
@@ -186,7 +203,7 @@ def _model_row(r: ModelResult, prompt_idx: int, *, bg: str) -> str:
         f'<code style="background:#f3f4f6;padding:1px 6px;'
         f'border-radius:3px;font-size:12px;color:#1a1a1a;'
         f'font-family:SFMono-Regular,Consolas,Menlo,monospace">'
-        f'{html_escape(r.model)}</code></td>'
+        f'{html_escape(_display_model(r))}</code></td>'
         f'<td style="{_CELL_R}">{ttft_think}</td>'
         f'<td style="{_CELL_R}">{ttft}</td>'
         f'<td style="{_CELL_R};font-weight:600;color:#0b5fff">{tps}</td>'

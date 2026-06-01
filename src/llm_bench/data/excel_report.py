@@ -148,6 +148,22 @@ def _descriptor_field(result: ModelResult, key: str) -> Any:
     return d.get(key)
 
 
+def _display_model(result: ModelResult) -> str:
+    """Model id for the Model column.
+
+    Ollama echoes a ``model`` field on every ``/api/chat`` chunk, which
+    the benchmark captures into ``QuestionResult.server_model``. We use
+    the first non-empty server value so the column reflects what the
+    server actually served (tag resolution, ``:latest`` expansion, ...),
+    falling back to the configured ``result.model`` when none was
+    recorded (request never streamed a chunk).
+    """
+    for q in result.questions:
+        if q.server_model:
+            return q.server_model
+    return result.model
+
+
 def _format_tristate_bool(value: bool | None) -> str:
     """Render Optional[bool] as Yes / No / "" so empty doesn't look like
     a probe that explicitly returned False.
@@ -202,7 +218,7 @@ def _row_for(result: ModelResult, prompt_idx: int) -> list[Any]:
 
     field_map: dict[str, Any] = {
         "app_name": result.app_name,
-        "model": result.model,
+        "model": _display_model(result),
         "api_type": str(result.api_type),
         "ollama_supports_thinking": _format_tristate_bool(
             result.ollama_supports_thinking),

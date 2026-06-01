@@ -102,6 +102,13 @@ class QuestionResult:
     ok: bool = False
     error: str | None = None
     response_chars: int = 0
+    # Server-reported model identifier echoed back by the backend on the
+    # response stream (Ollama: the `model` field on every /api/chat chunk,
+    # e.g. "qwen3:8b"). Empty when the backend did not report one. The
+    # report renderers prefer this over the configured model name for
+    # Ollama rows so the MODEL column reflects what the server actually
+    # served (tag resolution, :latest expansion, etc.).
+    server_model: str = ""
     wall_seconds: float = 0.0
     ttft_seconds: float = 0.0
     thinking_ttft_seconds: float = 0.0

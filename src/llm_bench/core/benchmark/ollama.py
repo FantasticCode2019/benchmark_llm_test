@@ -366,6 +366,11 @@ def _attempt_once_ollama(
     first_response_at: float | None = None
     response_parts: list[str] = []
     final_chunk: dict = {}
+    # Server-reported model id. Ollama echoes a `model` field on every
+    # /api/chat chunk (e.g. "qwen3:8b"); we keep the first non-empty one
+    # so the report shows the model the server actually served, which may
+    # differ from the configured id (tag resolution, ":latest", ...).
+    server_model = ""
 
     try:
         with urllib.request.urlopen(req, timeout=request_timeout) as resp:
@@ -382,6 +387,14 @@ def _attempt_once_ollama(
 
                 if not isinstance(chunk, dict):
                     continue
+
+                # Capture the server-reported model id from the first chunk
+                # that carries one. Ollama puts it on every chunk, so the
+                # first non-empty value is authoritative for the whole run.
+                if not server_model:
+                    chunk_model = chunk.get("model")
+                    if isinstance(chunk_model, str) and chunk_model.strip():
+                        server_model = chunk_model.strip()
 
                 # /api/chat nests the deltas under message.{thinking,
                 # content} — that's our primary path. The /api/generate
@@ -557,6 +570,7 @@ def _attempt_once_ollama(
             prompt=prompt,
             ok=False,
             error=err,
+            server_model=server_model,
             response_chars=sum(len(p) for p in response_parts),
             wall_seconds=round(wall, 3),
             ttft_seconds=ttft_seconds,
@@ -574,6 +588,7 @@ def _attempt_once_ollama(
     return QuestionResult(
         prompt=prompt,
         ok=True,
+        server_model=server_model,
         response_chars=sum(len(p) for p in response_parts),
         wall_seconds=round(wall, 3),
 

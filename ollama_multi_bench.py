@@ -1021,7 +1021,8 @@ def uninstall_all(cfg: BenchConfig) -> None:
             log.info("[uninstall] %s ...", t.app_name)
             market_uninstall(t.app_name,
                              watch_minutes=cfg.uninstall_minutes,
-                             delete_data=cfg.delete_data)
+                             delete_data=cfg.delete_data,
+                             market_source=cfg.market_source)
             log.info("[uninstall] %s done", t.app_name)
         except Exception as exc:
             log.warning("[uninstall] %s failed (continuing): %s",
