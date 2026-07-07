@@ -128,12 +128,26 @@ class BenchmarkRunError(BenchmarkError):
     """
 
 
+# ---------------------------------------------------------------------------
+# App clone (app-store v2 /clone endpoint)
+# ---------------------------------------------------------------------------
+
+
+class CloneError(BenchmarkError):
+    """The app-store ``/clone`` HTTP call failed in a way the staged clone
+    flow can't recover from: a transport error, a non-JSON body, or a
+    server verdict that is neither "success" nor a recognised
+    "needs more input" (422) response.
+    """
+
+
 __all__ = [
     "BenchmarkError",
     "BenchmarkRunError",
     "BundleConfigError",
     "BundleProgressError",
     "CliError",
+    "CloneError",
     "ConfigError",
     "ConfigValidationError",
     "EntranceError",

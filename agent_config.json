@@ -1,0 +1,8 @@
+{
+  "base_url": "https://30cd0ba8.yuetest002.olares.com/v1",
+  "api_key": "empty",
+  "model": "Qwen/Qwen3.5-2B",
+  "temperature": 0.2,
+  "max_tool_rounds": 5,
+  "timeout_seconds": 60
+}
